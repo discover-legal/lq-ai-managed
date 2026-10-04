@@ -74,6 +74,16 @@ class StreamUploadResult:
     storage_path: str
 
 
+def _use_azure_blob() -> bool:
+    """Managed-fork hook: True when ``STORAGE_BACKEND=azureblob``.
+
+    Each public function below delegates to :mod:`app.storage_blob` when
+    this is set (imported lazily — it imports this module). The S3 code
+    paths are otherwise unchanged. See docs/managed/adr/M-0001.
+    """
+    return get_settings().storage_backend == "azureblob"
+
+
 def _build_session() -> aioboto3.Session:
     settings = get_settings()
     return aioboto3.Session(
@@ -108,6 +118,10 @@ async def ensure_bucket() -> None:
     Called from the FastAPI lifespan on startup. A 404 from HeadBucket means
     "create it"; anything else (403, network error) propagates.
     """
+    if _use_azure_blob():
+        from app import storage_blob
+
+        return await storage_blob.ensure_container()
     settings = get_settings()
     bucket = settings.s3_bucket
     async with s3_client() as s3:
@@ -136,6 +150,10 @@ async def ensure_bucket() -> None:
 
 async def check_storage() -> bool:
     """Readiness check: returns True if the configured bucket is reachable."""
+    if _use_azure_blob():
+        from app import storage_blob
+
+        return await storage_blob.check_storage()
     settings = get_settings()
     try:
         async with s3_client() as s3:
@@ -191,6 +209,16 @@ async def stream_upload(
         :class:`PayloadTooLarge`: Stream exceeded ``max_size_bytes``.
         :class:`InternalError`: the S3-compatible store returned an unexpected error.
     """
+
+    if _use_azure_blob():
+        from app import storage_blob
+
+        return await storage_blob.stream_upload(
+            storage_path=storage_path,
+            chunks=chunks,
+            content_type=content_type,
+            max_size_bytes=max_size_bytes,
+        )
 
     if max_size_bytes <= 0:
         raise InternalError(
@@ -358,6 +386,13 @@ async def stream_download(*, storage_path: str) -> AsyncIterator[AsyncIterator[b
         :class:`InternalError`: object missing or S3-compatible store error.
     """
 
+    if _use_azure_blob():
+        from app import storage_blob
+
+        async with storage_blob.stream_download(storage_path=storage_path) as blob_chunks:
+            yield blob_chunks
+        return
+
     settings = get_settings()
     bucket = settings.s3_bucket
 
@@ -426,6 +461,11 @@ async def delete_object(*, storage_path: str) -> None:
     A best-effort delete: 404 is treated as success (idempotent).
     """
 
+    if _use_azure_blob():
+        from app import storage_blob
+
+        return await storage_blob.delete_object(storage_path=storage_path)
+
     settings = get_settings()
     bucket = settings.s3_bucket
 
@@ -464,6 +504,13 @@ async def upload_bytes(*, storage_path: str, body: bytes, content_type: str) -> 
     size is not known up front.
     """
 
+    if _use_azure_blob():
+        from app import storage_blob
+
+        return await storage_blob.upload_bytes(
+            storage_path=storage_path, body=body, content_type=content_type
+        )
+
     settings = get_settings()
     bucket = settings.s3_bucket
 
@@ -487,6 +534,13 @@ async def presigned_get_url(*, storage_path: str, expires_in_seconds: int) -> st
     ``expires_in_seconds`` is the validity window (S3 max is 7 days).
     The D6 endpoint uses 24h.
     """
+
+    if _use_azure_blob():
+        from app import storage_blob
+
+        return await storage_blob.presigned_get_url(
+            storage_path=storage_path, expires_in_seconds=expires_in_seconds
+        )
 
     settings = get_settings()
     bucket = settings.s3_bucket

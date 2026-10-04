@@ -43,6 +43,14 @@ dependencies = [
     # backend's storage path (Task C4) is async and we don't want to block
     # the event loop on file I/O. Pulls boto3/botocore transitively.
     "aioboto3>=15.5.0,<16",
+    # Managed fork — native Azure Blob backend (app/storage_blob.py,
+    # docs/managed/adr/M-0001). azure-storage-blob's async client runs on
+    # aiohttp, already in the lock via aiobotocore, so no new transport.
+    # azure-identity provides DefaultAzureCredential (managed identity), so
+    # Azure deployments hold no storage keys; the gateway's planned
+    # managed-identity auth for Azure OpenAI reuses it.
+    "azure-storage-blob>=12.24,<13",
+    "azure-identity>=1.19,<2",
     # httpx is FastAPI's recommended async HTTP client and is used by the
     # gateway client. Already a transitive of fastapi/starlette test deps,
     # declared explicitly here because we use it at runtime, not just in tests.
