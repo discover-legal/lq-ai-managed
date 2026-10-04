@@ -34,7 +34,7 @@ multi-tenancy is added.
 - Redis: **container** for Shared + DIY; **Azure Managed Redis** for dedicated tiers. Test arq job-loss recovery on container restart.
 
 ## 5. File storage
-**Native Azure Blob adapter**, built in this fork **for upstream contribution** (see 15) replacing the S3 path in `api/app/storage.py`. Gains: per-account keys, immutability/legal hold, soft delete, versioning, lifecycle. Carry cost: merge upstream `storage.py` changes and future object-store ops migrations; Azurite-based tests.
+**Native Azure Blob adapter** in this fork (fork stays private for now — see 15) replacing the S3 path in `api/app/storage.py`. Gains: per-account keys, immutability/legal hold, soft delete, versioning, lifecycle. Carry cost: merge upstream `storage.py` changes and future object-store ops migrations; Azurite-based tests.
 
 ## 6. Sign-in
 - **Generic OIDC** in the fork (Entra, Google Workspace, Okta, …).
@@ -97,7 +97,7 @@ Sized for a one-to-two-person operation at launch.
 - **Weekly merge of upstream `main` into a staging branch**; clients receive **upstream tagged releases** (plus expedited security fixes).
 - Fork changes structured as **modules + small hooks**: interfaces with new per-backend/provider files (e.g. `STORAGE_BACKEND=s3|azureblob`, pluggable auth provider, gateway adapters, audit exporter), touching as few upstream lines as possible; documented via ADRs.
 - Rollout in **rings** (test → internal → Shared → dedicated) with a **monthly maintenance window**; security fixes expedited.
-- **Contribute everything upstream, including the Blob adapter**, following upstream's CONTRIBUTING/DCO/ADR process.
+- **Fork stays private for now** — no upstream contributions. Modules + hooks structure is kept so upstream merges stay cheap and contribution remains possible later (possible LegalQuants collaboration).
 
 ## - **Branding: co-brand** — MSP brand + "powered by LQ.AI"; **Open WebUI branding left intact** (web/LICENSE clause 4 forbids removal above 50 end users per deployment without permission/enterprise licence); LQ.AI trademark owned by LegalQuants — nominative use only without permission.
 - **Platform: base fee + per seat.** Base covers the per-client infra floor (rough, before model usage: Shared ~US$130–200/mo; Dedicated ~US$1,800–2,200/mo, dominated by Firewall Standard + App Gateway).
@@ -115,11 +115,11 @@ Sized for a one-to-two-person operation at launch.
 - At launch: **DPA + published sub-processor list** (GDPR Art. 28, PIPEDA, Quebec Law 25).
 - **Compliance automation platform** (Vanta/Drata/Secureframe class) for policies and evidence.
 - Auditor-sensitive choices to justify when certifying: standing admin access (11), internal-only activity logs (12), annual restore tests (13).
-- Upstream `docs/compliance/` alignment docs are stubs — authoring them advances certification and goes upstream (15).
+- Upstream `docs/compliance/` alignment docs are stubs — authoring them in the fork advances certification.
 
 ## Build backlog derived from these decisions
 
-### Fork (app) changes — modules + hooks, contributed upstream
+### Fork (app) changes — modules + hooks (private fork)
 1. Storage backend interface + **Azure Blob adapter** (`STORAGE_BACKEND=s3|azureblob`), Azurite tests.
 2. **Generic OIDC sign-in**; local accounts off; first-admin bootstrap; **IdP re-check on refresh**; **SCIM** provisioning.
 3. Gateway: **Azure OpenAI managed-identity auth**; **Claude via Foundry** adapter/verification.
