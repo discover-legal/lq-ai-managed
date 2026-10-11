@@ -67,6 +67,30 @@ class Settings(BaseSettings):
     s3_bucket: str = Field(default="lq-ai-files", description="S3 bucket for uploaded files.")
     s3_region: str = Field(default="us-east-1", description="S3 region.")
 
+    # ----- Object storage backend selection (managed fork) -----
+    # ``s3`` (default) keeps upstream behaviour: the S3-compatible client in
+    # ``app.storage``. ``azureblob`` routes every ``app.storage`` call to the
+    # native Azure Blob backend in ``app.storage_blob`` (docs/managed/adr/
+    # M-0001). Auth: ``azure_storage_connection_string`` when set (Azurite,
+    # account-key setups); otherwise ``DefaultAzureCredential`` against
+    # ``azure_storage_account_url`` (managed identity — no keys).
+    storage_backend: Literal["s3", "azureblob"] = Field(
+        default="s3",
+        description="Object storage backend: 's3' (S3-compatible) or 'azureblob'.",
+    )
+    azure_storage_account_url: str = Field(
+        default="",
+        description="Blob service URL, e.g. https://<account>.blob.core.windows.net.",
+    )
+    azure_storage_container: str = Field(
+        default="lq-ai-files",
+        description="Blob container for uploaded files.",
+    )
+    azure_storage_connection_string: str = Field(
+        default="",
+        description="Optional connection string (Azurite / account key); overrides the URL.",
+    )
+
     # ----- File upload limits (Task C4) -----
     # Per-request cap on uploaded-file size. Documented in `.env.example`
     # as ``LQ_AI_MAX_UPLOAD_SIZE_MB``. The handler streams the body and

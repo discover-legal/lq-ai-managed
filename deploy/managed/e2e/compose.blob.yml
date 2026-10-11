@@ -1,0 +1,28 @@
+# Compose override: run the stack with STORAGE_BACKEND=azureblob against
+# Azurite (Microsoft's local Blob emulator). Managed fork, test use only —
+# the connection string below is Azurite's public development key.
+#
+#   docker compose -f docker-compose.yml -f deploy/managed/e2e/compose.blob.yml up -d
+#
+# RustFS still starts (the api and workers depend on it); the e2e script
+# checks that nothing is written there.
+x-blob-env: &blob-env
+  STORAGE_BACKEND: azureblob
+  AZURE_STORAGE_CONTAINER: lq-ai-files
+  AZURE_STORAGE_CONNECTION_STRING: "DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://azurite:10000/devstoreaccount1;"
+
+services:
+  azurite:
+    image: mcr.microsoft.com/azure-storage/azurite
+    command: azurite-blob --blobHost 0.0.0.0 --skipApiVersionCheck --loose
+    ports:
+      - "127.0.0.1:10000:10000"
+  api:
+    environment: *blob-env
+    depends_on: [azurite]
+  ingest-worker:
+    environment: *blob-env
+    depends_on: [azurite]
+  arq-worker:
+    environment: *blob-env
+    depends_on: [azurite]
