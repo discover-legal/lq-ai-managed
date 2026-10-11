@@ -48,6 +48,8 @@ multi-tenancy is added.
 - **Apply for modified abuse monitoring** (no prompt retention); **keyless managed-identity auth** to be built in the fork.
 - Fork work: verify/adapt gateway Anthropic adapter for Claude via Foundry.
 
+- **Local document embeddings are a supported option in general**, not only for the local-GPU add-on: any client may run document search without a cloud provider (air-gapped, Tier-1-only, or by preference). Requires fork work: Ollama embeddings in the gateway (`gateway/app/providers/ollama.py` currently refuses) and a local embedding model whose output fits LQ.AI's `vector(1536)` column (natively or by truncation) — or a configurable dimension. Decided 2026-10-11.
+
 ## 8. Regions and residency
 - Markets: **Canada, US, EU**.
 - Model processing: **in-zone** — Data Zone in US/EU; regional deployments in Canada (narrower model set; Claude via Foundry may be unavailable in Canada — verify).
@@ -80,7 +82,8 @@ Sized for a one-to-two-person operation at launch.
 - **Azure activity logs** (incl. MSP staff actions): **kept internal**, provided on request.
 - No customer-managed-key log cluster (cost); content is kept out of Azure Monitor instead.
 
-## - Included baseline: **backup and restore** — Postgres geo-redundant backup (must be enabled at server creation; CMK key must exist in the paired region, client-provided on dedicated tiers), Blob soft delete/versioning; rebuild in the paired region via Terraform. Typical RPO ≤ ~1h, RTO hours–a day.
+## 13. Backups and disaster recovery
+- Included baseline: **backup and restore** — Postgres geo-redundant backup (must be enabled at server creation; CMK key must exist in the paired region, client-provided on dedicated tiers), Blob soft delete/versioning; rebuild in the paired region via Terraform. Typical RPO ≤ ~1h, RTO hours–a day.
 - **Warm standby** (cross-region replica, pre-built infra): **paid add-on**.
 - **Zone redundancy** (Postgres zone-redundant HA, zone-redundant compute/storage): **paid add-on**. Note: Container Apps environment and AKS node-pool zone settings are fixed at creation — ask at onboarding or plan a rebuild.
 - Retention (PITR window / long-term copies): **client chooses** at onboarding within supported limits (PITR 7–35 days; long-term via Azure Backup or immutable dumps).
@@ -99,7 +102,8 @@ Sized for a one-to-two-person operation at launch.
 - Rollout in **rings** (test → internal → Shared → dedicated) with a **monthly maintenance window**; security fixes expedited.
 - **Fork stays private for now** — no upstream contributions. Modules + hooks structure is kept so upstream merges stay cheap and contribution remains possible later (possible LegalQuants collaboration).
 
-## - **Branding: co-brand** — MSP brand + "powered by LQ.AI"; **Open WebUI branding left intact** (web/LICENSE clause 4 forbids removal above 50 end users per deployment without permission/enterprise licence); LQ.AI trademark owned by LegalQuants — nominative use only without permission.
+## 16. Pricing and branding
+- **Branding: co-brand** — MSP brand + "powered by LQ.AI"; **Open WebUI branding left intact** (web/LICENSE clause 4 forbids removal above 50 end users per deployment without permission/enterprise licence); LQ.AI trademark owned by LegalQuants — nominative use only without permission.
 - **Platform: base fee + per seat.** Base covers the per-client infra floor (rough, before model usage: Shared ~US$130–200/mo; Dedicated ~US$1,800–2,200/mo, dominated by Firewall Standard + App Gateway).
 - **Resold model usage: cost + markup**, metered at the gateway. BYOK clients pay platform only.
 - **DIY templates: free lead magnet.**
@@ -122,7 +126,7 @@ Sized for a one-to-two-person operation at launch.
 ### Fork (app) changes — modules + hooks (private fork)
 1. Storage backend interface + **Azure Blob adapter** (`STORAGE_BACKEND=s3|azureblob`), Azurite tests.
 2. **Generic OIDC sign-in**; local accounts off; first-admin bootstrap; **IdP re-check on refresh**; **SCIM** provisioning.
-3. Gateway: **Azure OpenAI managed-identity auth**; **Claude via Foundry** adapter/verification.
+3. Gateway: **Azure OpenAI managed-identity auth**; **Claude via Foundry** adapter/verification; **Ollama (local) embeddings** with a 1,536-compatible model or configurable dimension.
 4. **Audit-log exporter** (immutable Blob / client SIEM).
 5. App secrets (Fernet master keys etc.) sourced from **Key Vault**.
 6. **Trusted-proxy client IP** handling (Application Gateway in front; today the API logs the proxy IP).
@@ -145,3 +149,24 @@ Sized for a one-to-two-person operation at launch.
 - Legal review: Open WebUI clause 4 interpretation per deployment; LQ.AI trademark use.
 - MCA billing for subscriptions in MSP-created tenants.
 - Azure OpenAI modified abuse monitoring application.
+
+## Status (2026-10-11)
+
+| Item | State | Where |
+|---|---|---|
+| Decision record | Done (this file) | branch `managed/decisions` |
+| 1. Azure Blob storage backend | Built; unit, Azurite and full-stack e2e tests pass (15/15); CI green | branch `managed/blob-storage`, PR #1 (draft) |
+| E2E harness for Blob | Done | `deploy/managed/e2e/` on `managed/blob-storage` |
+| Upstream LQ.AI improvement write-up | Done | Claude Doc "LQ.AI — Improvements the Upstream Repo Needs" (https://claude.ai/code/artifact/e13db48a-2347-4281-9e10-a55bd156d7df) |
+| 2. Generic OIDC + SCIM | Next | — |
+| 3. Local (Ollama) embeddings | Decided, not started | — |
+| Everything else in the backlog | Not started | — |
+
+## Handoff for the next session
+
+- **Repos/branches:** fork `discover-legal/lq-ai-managed`; `main` is 3 commits behind upstream `LegalQuants/lq-ai` (the PR branches carry them). Add upstream as a remote: `git remote add upstream https://github.com/LegalQuants/lq-ai`.
+- **Commit identity:** commits so far are signed off as `Claude <noreply@anthropic.com>`. The owner's name/email for DCO sign-off is still to be provided; set `git config user.name/user.email` before new commits.
+- **Not yet tested anywhere:** the web UI against Blob; chat/search with a model (local or cloud); a real Azure storage account with managed identity.
+- **Sandbox network note:** the cloud session blocked `pkg-containers.githubusercontent.com`, `dl-cdn.alpinelinux.org`, `deb.debian.org`, `download.pytorch.org`, `huggingface.co`, `registry.ollama.ai` and `ollama.com`, so the `web` image and Ollama models could not be built/pulled there. A desktop session (or GitHub Actions) has no such limits.
+- **Local model test plan:** `docker compose --profile local up` adds Ollama; pull a small chat model (1–3B) for CPU smoke tests; route a chat alias to `ollama-local` in `gateway.yaml`. Document search stays on OpenAI/Azure OpenAI embeddings until item 3 lands.
+- **PR #1:** draft, CI green; mark ready for review when the owner is satisfied.
