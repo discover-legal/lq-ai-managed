@@ -22,8 +22,11 @@ Round-trip against a real Blob endpoint (Azurite) is in
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
+import socket
+import time
 from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -180,7 +183,7 @@ def _azureblob_backend(
     get_settings.cache_clear()
 
     @asynccontextmanager
-    async def _ctx() -> AsyncIterator[FakeBlobService]:
+    async def _ctx(*, fail_fast: bool = False) -> AsyncIterator[FakeBlobService]:
         yield fake_blob
 
     with patch("app.storage_blob.blob_service_client", _ctx):
@@ -402,6 +405,44 @@ async def test_check_storage_reports_reachability(fake_blob: FakeBlobService) ->
     assert await check_storage() is False
     fake_blob.containers.add(CONTAINER)
     assert await check_storage() is True
+
+
+@pytest.mark.unit
+async def test_check_storage_fails_fast_when_endpoint_is_unreachable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: the SDK's default retry backoff held /ready for ~85 s."""
+
+    with socket.socket() as sock:  # reserve a port, then free it: nothing listens
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    monkeypatch.setenv(
+        "AZURE_STORAGE_CONNECTION_STRING",
+        f"DefaultEndpointsProtocol=http;AccountName={ACCOUNT};AccountKey={ACCOUNT_KEY};"
+        f"BlobEndpoint=http://127.0.0.1:{port}/{ACCOUNT};",
+    )
+    monkeypatch.setenv("NO_PROXY", "127.0.0.1")
+    get_settings.cache_clear()
+
+    started = time.monotonic()
+    with patch("app.storage_blob.blob_service_client", _REAL_BLOB_SERVICE_CLIENT):
+        assert await check_storage() is False
+    assert time.monotonic() - started < storage_blob.READINESS_TIMEOUT_SECONDS + 2
+
+
+@pytest.mark.unit
+async def test_check_storage_gives_up_at_the_deadline(
+    monkeypatch: pytest.MonkeyPatch, fake_blob: FakeBlobService
+) -> None:
+    async def _hang(self: _FakeContainerClient) -> dict[str, Any]:
+        await asyncio.sleep(60)
+        return {}
+
+    monkeypatch.setattr(_FakeContainerClient, "get_container_properties", _hang)
+    monkeypatch.setattr(storage_blob, "READINESS_TIMEOUT_SECONDS", 0.05)
+    fake_blob.containers.add(CONTAINER)
+
+    assert await check_storage() is False
 
 
 @pytest.mark.unit

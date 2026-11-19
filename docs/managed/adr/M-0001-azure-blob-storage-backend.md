@@ -39,7 +39,17 @@ Add a second backend, selected by `STORAGE_BACKEND=azureblob`
 * **Auth.** `AZURE_STORAGE_CONNECTION_STRING` when set (Azurite, account
   key); otherwise `DefaultAzureCredential` on `AZURE_STORAGE_ACCOUNT_URL`
   (managed identity, no storage keys). Role: Storage Blob Data
-  Contributor on the container.
+  Contributor assigned at **storage-account scope** (or above). A
+  container-scoped assignment is not enough: Get User Delegation Key
+  (which signs download links) is an account-level operation, and so is
+  creating the container at startup.
+* **Retries and readiness.** The SDK's default retry policy backs off
+  15 s and up between attempts; with the account unreachable the readiness
+  check took 85 s to answer (S3 path: 3.5 s). The client keeps three
+  retries but backs off in seconds (`_CLIENT_OPTIONS`), and
+  `check_storage` makes one attempt under a 5 s deadline
+  (`READINESS_TIMEOUT_SECONDS`). Measured after the change, connection
+  refused: readiness 0.1 s, startup container bootstrap 16.5 s.
 * **Dependencies.** `azure-storage-blob` + `azure-identity` (+ `azure-core`,
   `msal`, `msal-extensions`, `isodate`). The async client uses `aiohttp`,
   already locked via `aiobotocore`. `azure-identity` is reused by the
@@ -60,8 +70,9 @@ Add a second backend, selected by `STORAGE_BACKEND=azureblob`
 
 ## Verification
 
-* `api/tests/test_storage_blob.py` — 17 unit tests through the public
-  `app.storage` API with an in-memory fake.
+* `api/tests/test_storage_blob.py` — 19 unit tests through the public
+  `app.storage` API with an in-memory fake, including the readiness
+  fail-fast and deadline cases.
 * `api/tests/test_storage_blob_azurite.py` — round trip against Azurite
   (multi-block upload, download, SAS fetched over HTTP, idempotent delete,
   oversize leaves nothing). Runs when `AZURITE_CONNECTION_STRING` is set.

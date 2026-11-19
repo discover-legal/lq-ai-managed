@@ -26,12 +26,24 @@ Auth
 account-key deployments). Otherwise ``DefaultAzureCredential`` is used
 against ``AZURE_STORAGE_ACCOUNT_URL`` — managed identity in Azure, so no
 storage keys exist in the deployment. The identity needs the "Storage
-Blob Data Contributor" role on the container (create, read, write,
-delete, user delegation key).
+Blob Data Contributor" role assigned at **storage-account scope** (or
+above): Get User Delegation Key, which signs download links, is an
+account-level operation and is refused (403) under a container-scoped
+assignment, as is creating the container at startup.
+
+Retries
+-------
+
+The SDK's default retry policy backs off 15 s and up between attempts, so
+an unreachable account would hold a request (and startup) for well over a
+minute. The client is built with ``_CLIENT_OPTIONS`` — the same three
+retries, backing off in seconds — and the readiness check makes a single
+attempt under a hard ``READINESS_TIMEOUT_SECONDS`` deadline.
 """
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import logging
@@ -62,6 +74,22 @@ MAX_SAS_SECONDS = 7 * 24 * 60 * 60
 # Clock-skew allowance on SAS start times.
 SAS_CLOCK_SKEW = timedelta(minutes=5)
 
+# Client-wide transport/retry tuning. The SDK defaults (initial_backoff=15,
+# increment_base=3) wait 15 s, 18 s and 24 s (± jitter) between attempts —
+# measured at 85 s before a connection-refused error surfaced, against
+# ~3.5 s on the S3 path. Keep the retry count; back off in seconds.
+_CLIENT_OPTIONS: dict[str, Any] = {
+    "retry_total": 3,
+    "initial_backoff": 1,
+    "increment_base": 2,
+    "random_jitter_range": 1,
+    "connection_timeout": 10,
+}
+
+# Hard ceiling on the readiness check, covering credential acquisition as
+# well as the storage call. /ready is polled; it must answer promptly.
+READINESS_TIMEOUT_SECONDS = 5.0
+
 
 def _block_id(n: int) -> str:
     """Return the base64 block ID for part ``n``.
@@ -74,14 +102,19 @@ def _block_id(n: int) -> str:
 
 
 @asynccontextmanager
-async def blob_service_client() -> AsyncIterator[BlobServiceClient]:
+async def blob_service_client(*, fail_fast: bool = False) -> AsyncIterator[BlobServiceClient]:
     """Yield a configured async ``BlobServiceClient``; close it (and any
-    credential) on exit."""
+    credential) on exit.
+
+    ``fail_fast`` disables retries — for the readiness probe, where a quick
+    "no" beats a late answer.
+    """
 
     settings = get_settings()
+    options = {**_CLIENT_OPTIONS, "retry_total": 0} if fail_fast else _CLIENT_OPTIONS
     if settings.azure_storage_connection_string:
         async with BlobServiceClient.from_connection_string(
-            settings.azure_storage_connection_string
+            settings.azure_storage_connection_string, **options
         ) as service:
             yield service
         return
@@ -99,7 +132,9 @@ async def blob_service_client() -> AsyncIterator[BlobServiceClient]:
 
     async with (
         DefaultAzureCredential() as credential,
-        BlobServiceClient(settings.azure_storage_account_url, credential=credential) as service,
+        BlobServiceClient(
+            settings.azure_storage_account_url, credential=credential, **options
+        ) as service,
     ):
         yield service
 
@@ -117,15 +152,21 @@ async def ensure_container() -> None:
 
 
 async def check_storage() -> bool:
-    """Readiness check: True if the configured container is reachable."""
+    """Readiness check: True if the configured container is reachable.
+
+    One attempt, bounded by ``READINESS_TIMEOUT_SECONDS``; never raises.
+    """
 
     container_name = get_settings().azure_storage_container
     try:
-        async with blob_service_client() as service:
+        async with (
+            asyncio.timeout(READINESS_TIMEOUT_SECONDS),
+            blob_service_client(fail_fast=True) as service,
+        ):
             await service.get_container_client(container_name).get_container_properties()
         return True
     except Exception as exc:
-        log.warning("Storage readiness check failed: %s", exc)
+        log.warning("Storage readiness check failed: %r", exc)
         return False
 
 
