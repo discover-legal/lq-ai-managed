@@ -30,12 +30,16 @@ import time
 from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager
 from datetime import datetime
-from typing import Any
+from typing import Any, ClassVar
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlparse
 
 import pytest
-from azure.core.exceptions import ResourceExistsError, ResourceNotFoundError
+from azure.core.exceptions import (
+    ClientAuthenticationError,
+    ResourceExistsError,
+    ResourceNotFoundError,
+)
 from azure.storage.blob import UserDelegationKey
 
 from app import storage_blob
@@ -45,6 +49,7 @@ from app.storage import (
     MULTIPART_PART_SIZE,
     StreamUploadResult,
     check_storage,
+    close_storage,
     delete_object,
     ensure_bucket,
     presigned_get_url,
@@ -457,3 +462,157 @@ async def test_missing_configuration_raises_internal_error(
         async with _REAL_BLOB_SERVICE_CLIENT():
             pass
     assert "AZURE_STORAGE_ACCOUNT_URL" in exc_info.value.details["required"]
+
+
+# ---------------------------------------------------------------------------
+# shared credential (managed-identity auth)
+# ---------------------------------------------------------------------------
+
+
+class _FakeCredential:
+    instances: ClassVar[list[_FakeCredential]] = []
+
+    def __init__(self) -> None:
+        self.close_calls = 0
+        _FakeCredential.instances.append(self)
+
+    async def get_token(self, *scopes: str, **kwargs: Any) -> Any:
+        raise AssertionError("no test here reaches the network")
+
+    async def close(self) -> None:
+        self.close_calls += 1
+
+
+@pytest.fixture
+def credential_auth(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[_FakeCredential]]:
+    """Real client builder under credential auth, with a fake credential class."""
+
+    monkeypatch.delenv("AZURE_STORAGE_CONNECTION_STRING", raising=False)
+    monkeypatch.setenv("AZURE_STORAGE_ACCOUNT_URL", f"https://{ACCOUNT}.blob.core.windows.net")
+    get_settings.cache_clear()
+    _FakeCredential.instances = []
+    monkeypatch.setattr(storage_blob, "_shared", None)
+    with (
+        patch("azure.identity.aio.DefaultAzureCredential", _FakeCredential),
+        patch("app.storage_blob.blob_service_client", _REAL_BLOB_SERVICE_CLIENT),
+    ):
+        yield _FakeCredential.instances
+
+
+@pytest.mark.unit
+async def test_credential_is_shared_across_calls_and_left_open(
+    credential_auth: list[_FakeCredential],
+) -> None:
+    async with storage_blob.blob_service_client() as first:
+        pass
+    async with storage_blob.blob_service_client(fail_fast=True) as second:
+        pass
+
+    assert len(credential_auth) == 1
+    assert first.credential is second.credential is credential_auth[0]
+    assert credential_auth[0].close_calls == 0
+
+
+@pytest.mark.unit
+async def test_connection_string_auth_never_builds_a_credential(
+    credential_auth: list[_FakeCredential], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(
+        "AZURE_STORAGE_CONNECTION_STRING",
+        f"DefaultEndpointsProtocol=https;AccountName={ACCOUNT};AccountKey={ACCOUNT_KEY};"
+        "EndpointSuffix=core.windows.net",
+    )
+    get_settings.cache_clear()
+
+    async with storage_blob.blob_service_client():
+        pass
+
+    assert credential_auth == []
+
+
+@pytest.mark.unit
+async def test_auth_failure_discards_the_credential(
+    credential_auth: list[_FakeCredential],
+) -> None:
+    # Wrapped the way the public functions wrap SDK errors.
+    with pytest.raises(InternalError):
+        async with storage_blob.blob_service_client():
+            try:
+                raise ClientAuthenticationError("token rejected")
+            except ClientAuthenticationError as exc:
+                raise InternalError("wrapped") from exc
+
+    assert credential_auth[0].close_calls == 1
+    async with storage_blob.blob_service_client():
+        pass
+    assert len(credential_auth) == 2
+    assert credential_auth[1].close_calls == 0
+
+
+@pytest.mark.unit
+async def test_other_failures_keep_the_credential(
+    credential_auth: list[_FakeCredential],
+) -> None:
+    with pytest.raises(ResourceNotFoundError):
+        async with storage_blob.blob_service_client():
+            raise ResourceNotFoundError("BlobNotFound")
+    async with storage_blob.blob_service_client():
+        pass
+
+    assert len(credential_auth) == 1
+    assert credential_auth[0].close_calls == 0
+
+
+@pytest.mark.unit
+async def test_discarded_credential_closes_only_after_last_user(
+    credential_auth: list[_FakeCredential],
+) -> None:
+    async with storage_blob.blob_service_client():  # an in-flight call
+        with pytest.raises(ClientAuthenticationError):
+            async with storage_blob.blob_service_client():
+                raise ClientAuthenticationError("token rejected")
+        assert credential_auth[0].close_calls == 0  # still in use
+
+        async with storage_blob.blob_service_client():  # new calls get a fresh one
+            pass
+        assert len(credential_auth) == 2
+
+    assert credential_auth[0].close_calls == 1
+
+
+@pytest.mark.unit
+async def test_credential_is_not_reused_across_event_loops_or_past_max_age(
+    credential_auth: list[_FakeCredential], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async with storage_blob.blob_service_client():
+        pass
+    holder = storage_blob._shared
+    assert holder is not None
+
+    other_loop = asyncio.new_event_loop()
+    other_loop.close()
+    holder.loop = other_loop
+    async with storage_blob.blob_service_client():
+        pass
+    assert len(credential_auth) == 2
+    assert credential_auth[0].close_calls == 0  # foreign loop: dropped, not awaited
+
+    monkeypatch.setattr(storage_blob, "CREDENTIAL_MAX_AGE_SECONDS", 0)
+    async with storage_blob.blob_service_client():
+        pass
+    assert len(credential_auth) == 3
+    assert credential_auth[1].close_calls == 1
+
+
+@pytest.mark.unit
+async def test_close_storage_closes_the_shared_credential(
+    credential_auth: list[_FakeCredential],
+) -> None:
+    async with storage_blob.blob_service_client():
+        pass
+
+    await close_storage()
+    await close_storage()  # idempotent
+
+    assert credential_auth[0].close_calls == 1
+    assert storage_blob._shared is None

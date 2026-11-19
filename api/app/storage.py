@@ -148,6 +148,18 @@ async def ensure_bucket() -> None:
         log.info("Created S3 bucket: %s", bucket)
 
 
+async def close_storage() -> None:
+    """Release process-wide storage resources at shutdown.
+
+    The S3 path holds none (a client per call). The Azure Blob path closes
+    its shared credential.
+    """
+    if _use_azure_blob():
+        from app import storage_blob
+
+        await storage_blob.close_shared_credential()
+
+
 async def check_storage() -> bool:
     """Readiness check: returns True if the configured bucket is reachable."""
     if _use_azure_blob():

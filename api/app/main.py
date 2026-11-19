@@ -33,7 +33,7 @@ from app.config import assert_production_secrets, get_settings
 from app.db.session import check_db, dispose_engine, get_session_factory
 from app.errors import LQAIError
 from app.skills import install_sighup_reload, install_skill_registry, resolve_skill_dirs
-from app.storage import check_storage, ensure_bucket
+from app.storage import check_storage, close_storage, ensure_bucket
 
 SERVICE_NAME = "lq-ai-api"
 log = logging.getLogger(__name__)
@@ -108,6 +108,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # logged but never propagate — shutdown is best-effort.
         for closer_name, closer in (
             ("gateway client", close_gateway_client),
+            ("storage", close_storage),
             ("redis", close_redis),
             ("db engine", dispose_engine),
         ):

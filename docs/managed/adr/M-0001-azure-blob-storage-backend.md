@@ -2,7 +2,7 @@
 
 **Status:** Accepted
 **Scope:** managed fork only (`docs/managed/DECISIONS.md` §5, §15)
-**Affected:** `api/app/storage.py`, `api/app/storage_blob.py`, `api/app/config.py`, `api/pyproject.toml`
+**Affected:** `api/app/storage.py`, `api/app/storage_blob.py`, `api/app/config.py`, `api/app/main.py`, `api/app/workers/arq_setup.py`, `api/app/workers/document_pipeline.py`, `api/pyproject.toml`
 
 Managed-fork records use the `M-` prefix under `docs/managed/adr/` so they
 never collide with upstream's numbered ADRs on merge.
@@ -43,6 +43,17 @@ Add a second backend, selected by `STORAGE_BACKEND=azureblob`
   container-scoped assignment is not enough: Get User Delegation Key
   (which signs download links) is an account-level operation, and so is
   creating the container at startup.
+* **Shared credential, guarded.** Under managed identity one
+  `DefaultAzureCredential` serves every call in the process, so the SDK
+  caches and refreshes tokens instead of fetching one per operation (and
+  per `/ready` poll). The share is fenced in: it is never reused across
+  event loops or a fork; an authentication failure discards it so the
+  next call rebuilds the credential chain; it is recycled after 12 h
+  regardless (`CREDENTIAL_MAX_AGE_SECONDS`); a discarded credential is
+  closed only after its last in-flight call finishes; and it is closed at
+  api and worker shutdown via `app.storage.close_storage()`. Authorization
+  failures (403, missing role) do not discard it. Connection-string auth
+  never creates one.
 * **Retries and readiness.** The SDK's default retry policy backs off
   15 s and up between attempts; with the account unreachable the readiness
   check took 85 s to answer (S3 path: 3.5 s). The client keeps three
@@ -70,9 +81,10 @@ Add a second backend, selected by `STORAGE_BACKEND=azureblob`
 
 ## Verification
 
-* `api/tests/test_storage_blob.py` — 19 unit tests through the public
+* `api/tests/test_storage_blob.py` — 26 unit tests through the public
   `app.storage` API with an in-memory fake, including the readiness
-  fail-fast and deadline cases.
+  fail-fast and deadline cases and the shared-credential guards (fake
+  credential; not exercised against a real managed identity).
 * `api/tests/test_storage_blob_azurite.py` — round trip against Azurite
   (multi-block upload, download, SAS fetched over HTTP, idempotent delete,
   oversize leaves nothing). Runs when `AZURITE_CONNECTION_STRING` is set.

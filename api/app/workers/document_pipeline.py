@@ -207,6 +207,12 @@ async def on_shutdown(ctx: dict[str, Any]) -> None:
         await dispose_engine()
     except Exception as exc:  # pragma: no cover - shutdown best-effort
         log.warning("worker shutdown: dispose_engine failed: %s", exc)
+    try:
+        from app.storage import close_storage
+
+        await close_storage()
+    except Exception as exc:  # pragma: no cover - shutdown best-effort
+        log.warning("worker shutdown: close_storage failed: %s", exc)
 
 
 # ---------------------------------------------------------------------------

@@ -31,6 +31,19 @@ above): Get User Delegation Key, which signs download links, is an
 account-level operation and is refused (403) under a container-scoped
 assignment, as is creating the container at startup.
 
+Credential lifetime
+-------------------
+
+Under credential auth one ``DefaultAzureCredential`` is shared by every
+call in the process, so tokens are cached and refreshed by the SDK rather
+than fetched from the identity endpoint per operation. The share is
+guarded (see ``_SharedCredential``): it is never used across event loops
+or a fork, it is dropped the moment the service reports an authentication
+failure (the next call starts from a fresh credential chain), it is
+recycled after ``CREDENTIAL_MAX_AGE_SECONDS`` regardless, and a dropped
+credential is closed only once its last in-flight call has finished.
+Connection-string auth never touches it.
+
 Retries
 -------
 
@@ -47,12 +60,18 @@ import asyncio
 import base64
 import hashlib
 import logging
+import os
+import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from azure.core.exceptions import ResourceExistsError, ResourceNotFoundError
+from azure.core.exceptions import (
+    ClientAuthenticationError,
+    ResourceExistsError,
+    ResourceNotFoundError,
+)
 from azure.storage.blob import (
     BlobBlock,
     BlobSasPermissions,
@@ -86,6 +105,11 @@ _CLIENT_OPTIONS: dict[str, Any] = {
     "connection_timeout": 10,
 }
 
+# Upper bound on how long one shared credential object is reused. Tokens
+# refresh themselves well inside this; the cap only bounds how long a
+# stale credential chain (e.g. after an identity change) can linger.
+CREDENTIAL_MAX_AGE_SECONDS = 12 * 60 * 60
+
 # Hard ceiling on the readiness check, covering credential acquisition as
 # well as the storage call. /ready is polled; it must answer promptly.
 READINESS_TIMEOUT_SECONDS = 5.0
@@ -101,10 +125,120 @@ def _block_id(n: int) -> str:
     return base64.b64encode(f"{n:08d}".encode()).decode()
 
 
+class _SharedCredential:
+    """A process-wide ``DefaultAzureCredential`` plus the state that makes
+    sharing it safe: where it was created, how many calls hold it, and
+    whether it has been retired."""
+
+    def __init__(self, credential: Any) -> None:
+        self.credential = credential
+        self.loop = asyncio.get_running_loop()
+        self.pid = os.getpid()
+        self.created_at = time.monotonic()
+        self.users = 0
+        self.retired = False
+        self.closed = False
+
+    def usable(self) -> bool:
+        """True while this credential may be handed to a new call."""
+
+        return (
+            not self.retired
+            and self.pid == os.getpid()
+            and self.loop is asyncio.get_running_loop()
+            and time.monotonic() - self.created_at < CREDENTIAL_MAX_AGE_SECONDS
+        )
+
+    async def close_if_idle(self) -> None:
+        """Close a retired credential once nothing is using it. Never raises."""
+
+        if not self.retired or self.users > 0 or self.closed:
+            return
+        self.closed = True
+        if self.pid != os.getpid() or self.loop.is_closed():
+            return  # its sessions belong to another process/loop; just drop it
+        if self.loop is not asyncio.get_running_loop():
+            return
+        try:
+            await self.credential.close()
+        except Exception as exc:
+            log.warning("Closing Azure credential failed: %r", exc)
+
+
+_shared: _SharedCredential | None = None
+
+
+def _is_auth_failure(exc: BaseException) -> bool:
+    """True if ``exc`` — or the error it wraps — is an authentication failure.
+
+    The public functions re-raise SDK errors as :class:`InternalError`
+    ``from`` the original, so the cause chain is checked too.
+    """
+
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        if isinstance(current, ClientAuthenticationError):
+            return True
+        seen.add(id(current))
+        current = current.__cause__ or current.__context__
+    return False
+
+
+@asynccontextmanager
+async def _shared_credential() -> AsyncIterator[Any]:
+    """Lend out the shared credential for the duration of one storage call."""
+
+    global _shared
+
+    holder = _shared
+    if holder is None or not holder.usable():
+        stale = holder
+        # Imported lazily: azure-identity is only needed for credential auth.
+        from azure.identity.aio import DefaultAzureCredential
+
+        # Swap before awaiting anything, so concurrent callers that arrive
+        # while the stale credential closes all see the same replacement.
+        holder = _SharedCredential(DefaultAzureCredential())
+        _shared = holder
+        if stale is not None:
+            stale.retired = True
+            await stale.close_if_idle()
+
+    holder.users += 1
+    try:
+        yield holder.credential
+    except BaseException as exc:
+        if _is_auth_failure(exc) and not holder.retired:
+            # Do not keep serving from a credential the service has refused:
+            # the next call rebuilds the chain from scratch.
+            holder.retired = True
+            if _shared is holder:
+                _shared = None
+            log.warning(
+                "Azure credential rejected; discarding the cached credential",
+                extra={"event": "storage_credential_discarded"},
+            )
+        raise
+    finally:
+        holder.users -= 1
+        await holder.close_if_idle()
+
+
+async def close_shared_credential() -> None:
+    """Retire and close the shared credential (process shutdown). Idempotent."""
+
+    global _shared
+
+    holder, _shared = _shared, None
+    if holder is not None:
+        holder.retired = True
+        await holder.close_if_idle()
+
+
 @asynccontextmanager
 async def blob_service_client(*, fail_fast: bool = False) -> AsyncIterator[BlobServiceClient]:
-    """Yield a configured async ``BlobServiceClient``; close it (and any
-    credential) on exit.
+    """Yield a configured async ``BlobServiceClient``; close it on exit.
 
     ``fail_fast`` disables retries — for the readiness probe, where a quick
     "no" beats a late answer.
@@ -127,11 +261,10 @@ async def blob_service_client(*, fail_fast: bool = False) -> AsyncIterator[BlobS
             },
         )
 
-    # Imported lazily: azure-identity is only needed for credential auth.
-    from azure.identity.aio import DefaultAzureCredential
-
+    # Closing the service client closes its own transport only; the shared
+    # credential outlives it (released, not closed, on exit).
     async with (
-        DefaultAzureCredential() as credential,
+        _shared_credential() as credential,
         BlobServiceClient(
             settings.azure_storage_account_url, credential=credential, **options
         ) as service,
