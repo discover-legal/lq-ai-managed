@@ -132,7 +132,9 @@ Add a second backend, selected by `STORAGE_BACKEND=azureblob`
 * `api/tests/test_storage_blob_azurite.py` — 4 tests against Azurite
   (multi-block upload, download, SAS fetched over HTTP, idempotent delete,
   oversize leaves nothing, calls share one client). Runs when
-  `AZURITE_CONNECTION_STRING` is set.
+  `AZURITE_CONNECTION_STRING` is set; the api job in
+  `.github/workflows/ci.yml` sets it against a pinned Azurite service
+  (that job has not yet run on GitHub with this change).
 * Run by hand with the real `DefaultAzureCredential` and no identity
   available: readiness answers False in under 0.3 s, logs one line,
   discards and closes the client, and leaves no unclosed sessions.

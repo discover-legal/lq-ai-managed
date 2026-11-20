@@ -119,14 +119,10 @@ jobs:
       # pin, not to relax the check. Only the Blob port is published.
       azurite:
         image: mcr.microsoft.com/azure-storage/azurite:3.38.0@sha256:c26024d62bf4a5b88a40968afd217234c00e1fc9a4790dc6105d1ca7979f6eec
+        # No health check: Azurite listens within a second of starting and
+        # the dependency install runs for far longer before pytest needs it.
         ports:
           - 10000:10000
-        # The image is Alpine-based; nc is the busybox applet.
-        options: >-
-          --health-cmd "nc -z 127.0.0.1 10000"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 10
 
     env:
       # asyncpg URL form per api/tests/conftest.py.
