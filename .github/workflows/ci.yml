@@ -5,7 +5,7 @@ name: CI
 #
 # Scope (per docs/SESSION-HANDOFF-2026-05-12-wave-d1-close.md §4 item 2):
 #   - web/    : svelte-check + Vitest
-#   - api/    : ruff + mypy (standard mode) + pytest (with Postgres) + coverage gate
+#   - api/    : ruff + mypy (standard mode) + pytest (with Postgres and Azurite) + coverage gate
 #   - gateway/: ruff + mypy --strict + pytest + coverage gate
 #   - api/Dockerfile.release: the skills-corpus guard (builds the `skills`
 #     stage only, so no dependency install; see scripts/release-image-check.sh)
@@ -105,6 +105,29 @@ jobs:
           --health-timeout 5s
           --health-retries 10
 
+      # Azurite (Microsoft's Blob Storage emulator) — managed fork. Without it
+      # api/tests/test_storage_blob_azurite.py is skipped (it runs only when
+      # AZURITE_CONNECTION_STRING is set, see the pytest step), leaving the
+      # STORAGE_BACKEND=azureblob code covered only by a hand-written fake.
+      # Pinned by tag + multi-arch index digest, same policy as postgres
+      # above; keep in step with deploy/managed/e2e/compose.blob.yml.
+      # Service containers cannot override the command, so this runs the
+      # image's default one: all three emulators, strict mode — neither
+      # --loose nor --skipApiVersionCheck. That is deliberate: if a uv.lock
+      # bump makes azure-storage-blob send an API version newer than this
+      # Azurite accepts, the suite fails here and the fix is to bump this
+      # pin, not to relax the check. Only the Blob port is published.
+      azurite:
+        image: mcr.microsoft.com/azure-storage/azurite:3.38.0@sha256:c26024d62bf4a5b88a40968afd217234c00e1fc9a4790dc6105d1ca7979f6eec
+        ports:
+          - 10000:10000
+        # The image is Alpine-based; nc is the busybox applet.
+        options: >-
+          --health-cmd "nc -z 127.0.0.1 10000"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
     env:
       # asyncpg URL form per api/tests/conftest.py.
       DATABASE_URL: postgresql+asyncpg://lq_ai:lq_ai@localhost:5432/lq_ai
@@ -188,6 +211,13 @@ jobs:
           # DE-230: bounded, derandomized Hypothesis profile for the
           # property suite (tests/property/conftest.py registers it).
           HYPOTHESIS_PROFILE: ci
+          # Un-skips tests/test_storage_blob_azurite.py against the azurite
+          # service above. xdist-safe: every test creates its own randomly
+          # named container. NOT a secret: the AccountKey is Azurite's
+          # fixed, publicly documented development key (devstoreaccount1),
+          # identical on every Azurite install and accepted by no real Azure
+          # account — a secret-scanner hit on this line is a false positive.
+          AZURITE_CONNECTION_STRING: "DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://127.0.0.1:10000/devstoreaccount1;"
 
       - name: Build reviewed helper acceptance images
         working-directory: ${{ github.workspace }}

@@ -13,8 +13,14 @@ x-blob-env: &blob-env
 
 services:
   azurite:
-    image: mcr.microsoft.com/azure-storage/azurite
-    command: azurite-blob --blobHost 0.0.0.0 --skipApiVersionCheck --loose
+    # Pinned by tag + multi-arch index digest; keep in step with the azurite
+    # service in .github/workflows/ci.yml.
+    image: mcr.microsoft.com/azure-storage/azurite:3.38.0@sha256:c26024d62bf4a5b88a40968afd217234c00e1fc9a4790dc6105d1ca7979f6eec
+    # Strict mode on purpose: no --loose, no --skipApiVersionCheck. Neither is
+    # needed (azure-storage-blob 12.31.0 sends API version 2026-10-06, the
+    # newest this Azurite accepts) and both would hide requests that real
+    # Azure rejects. If a newer SDK is refused, bump the pin above.
+    command: azurite-blob --blobHost 0.0.0.0
     ports:
       - "127.0.0.1:10000:10000"
   api:

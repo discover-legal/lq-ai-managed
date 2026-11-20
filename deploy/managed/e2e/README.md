@@ -1,11 +1,26 @@
 # End-to-end check: Azure Blob storage backend
 
 Runs the real stack with `STORAGE_BACKEND=azureblob` against Azurite and
-drives it over HTTP (15 checks): readiness, login, PDF upload, the bytes
-landing in Blob (and not RustFS), download, worker ingest, GDPR export
-through a read-only SAS link, and delete.
+drives it over HTTP: readiness, login, PDF upload, the bytes landing in
+Blob (and not RustFS), download, worker ingest, GDPR export through a
+read-only SAS link, and delete.
 
-Last result: 15/15 on 2026-10-05 (branch `managed/blob-storage`, PR #1).
+## Status: manual, not in CI
+
+Nothing runs this harness automatically. It is run by hand when the Blob
+backend or its wiring changes, and this file deliberately records no "last
+result": a dated pass says nothing about the current code. Treat the
+harness as unverified against your checkout until you have run it yourself;
+the script prints one PASS/FAIL line per check and exits non-zero if any
+check fails or if it has to abort early (failed login or upload).
+
+What CI does run on every PR is the narrower storage-layer round trip,
+`api/tests/test_storage_blob_azurite.py`, against the same pinned Azurite
+image (`.github/workflows/ci.yml`, api job). That covers `app.storage`
+only — not the HTTP API, the workers or the export flow checked here.
+
+Azurite runs in strict mode (no `--loose`, no `--skipApiVersionCheck`) so
+that requests real Azure would reject are not silently accepted.
 
 ## Run it
 

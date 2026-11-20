@@ -1,13 +1,19 @@
 """Round-trip tests for the Azure Blob backend against a real endpoint.
 
 Runs only when ``AZURITE_CONNECTION_STRING`` is set — Azurite, Microsoft's
-local Blob emulator, in dev/CI::
+local Blob emulator. CI sets it for the api pytest step (the ``azurite``
+service in ``.github/workflows/ci.yml``); locally::
 
-    docker run -d -p 10000:10000 mcr.microsoft.com/azure-storage/azurite \\
-        azurite-blob --blobHost 0.0.0.0 --skipApiVersionCheck --loose
+    docker run -d -p 10000:10000 mcr.microsoft.com/azure-storage/azurite:3.38.0 \\
+        azurite-blob --blobHost 0.0.0.0
     export AZURITE_CONNECTION_STRING="DefaultEndpointsProtocol=http;\\
     AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;\\
     BlobEndpoint=http://127.0.0.1:10000/devstoreaccount1;"
+
+Azurite runs strict: do not add ``--loose`` or ``--skipApiVersionCheck``.
+The suite passes without them, and they would hide requests real Azure
+rejects. The account key above is Azurite's public development key, not a
+secret.
 
 Drives the public :mod:`app.storage` API with ``STORAGE_BACKEND=azureblob``.
 """
