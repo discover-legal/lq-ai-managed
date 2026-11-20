@@ -121,6 +121,24 @@ Add a second backend, selected by `STORAGE_BACKEND=azureblob`
 * `docker-compose.yml` and the Helm chart do not pass the new settings
   yet; Azure deployments (Terraform) set them directly.
 
+## Known differences from the S3 path
+
+Pinned by paired tests in `api/tests/test_storage_parity.py`:
+
+* Backend failures in `delete_object`, `upload_bytes`, `presigned_get_url`
+  and `ensure_bucket`: S3 re-raises the raw client error; Blob raises
+  `InternalError`.
+* Link expiry over 7 days: S3 passes it through to the store; Blob clamps
+  to 7 days.
+* Upload rejected or failed after parts were sent: S3 aborts the
+  multipart upload; Blob has no abort and leaves uncommitted blocks for
+  the service to collect. Rejected on the first chunk, S3 has already
+  opened (and aborts) a multipart upload; Blob has made no call.
+* Empty body: S3 sends one zero-length part; Blob commits an empty block
+  list.
+* A typed application error other than `PayloadTooLarge` raised by the
+  body iterator: S3 wraps it in `InternalError`; Blob lets it through.
+
 ## Verification
 
 * `api/tests/test_storage_blob.py` — 38 unit test cases through the public
@@ -129,6 +147,16 @@ Add a second backend, selected by `STORAGE_BACKEND=azureblob`
   run against the real `BlobServiceClient` and pipeline with only the
   network (a fake transport) and the credential class faked.
 * `api/tests/test_config.py` — 5 cases for the auth-mode validator.
+* `api/tests/test_storage_dispatch.py` — 43 tests. Every public name in
+  `app.storage` must be either routed to a Blob counterpart (and proven
+  never to touch S3 under `azureblob`) or exempted with a reason; a new
+  upstream storage function with no guard fails this suite.
+* `api/tests/test_storage_parity.py` — 132 tests running the same contract
+  against both backends' in-memory fakes, because the upload loop is
+  deliberately duplicated rather than shared (the S3 code stays
+  upstream's). It also pins the known differences between the backends,
+  listed below. It compares code paths against fakes, not the two
+  services.
 * `api/tests/test_storage_blob_azurite.py` — 4 tests against Azurite
   (multi-block upload, download, SAS fetched over HTTP, idempotent delete,
   oversize leaves nothing, calls share one client). Runs when
