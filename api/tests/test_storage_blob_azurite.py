@@ -17,7 +17,7 @@ from __future__ import annotations
 import hashlib
 import os
 import secrets
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator
 
 import httpx
 import pytest
@@ -28,6 +28,7 @@ from app.errors import InternalError, PayloadTooLarge
 from app.storage import (
     MULTIPART_PART_SIZE,
     check_storage,
+    close_storage,
     delete_object,
     ensure_bucket,
     presigned_get_url,
@@ -45,13 +46,15 @@ pytestmark = [
 
 
 @pytest.fixture(autouse=True)
-def _azurite_backend(monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
+async def _azurite_backend(monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[str]:
     container = f"lqtest-{secrets.token_hex(4)}"
     monkeypatch.setenv("STORAGE_BACKEND", "azureblob")
     monkeypatch.setenv("AZURE_STORAGE_CONNECTION_STRING", CONNECTION_STRING)
+    monkeypatch.delenv("AZURE_STORAGE_ACCOUNT_URL", raising=False)
     monkeypatch.setenv("AZURE_STORAGE_CONTAINER", container)
     get_settings.cache_clear()
     yield container
+    await close_storage()  # the shared client, as the app does at shutdown
     get_settings.cache_clear()
 
 
@@ -97,6 +100,22 @@ async def test_round_trip_through_public_api(_azurite_backend: str) -> None:
     await delete_object(storage_path="doc-1")
     await delete_object(storage_path="doc-1")  # idempotent
     assert await _blob_names(_azurite_backend) == ["export.zip"]
+
+
+async def test_calls_share_one_client(_azurite_backend: str) -> None:
+    from app import storage_blob
+
+    await ensure_bucket()
+    first = storage_blob._client
+    assert first is not None
+    assert await check_storage() is True
+    await upload_bytes(storage_path="a", body=b"a", content_type="text/plain")
+    async with stream_download(storage_path="a") as chunks:
+        assert b"".join([c async for c in chunks]) == b"a"
+    await delete_object(storage_path="a")
+
+    assert storage_blob._client is first
+    assert not first.closed
 
 
 async def test_oversized_upload_commits_nothing(_azurite_backend: str) -> None:

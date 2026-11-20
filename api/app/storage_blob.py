@@ -22,36 +22,47 @@ Mapping from the S3 path
 Auth
 ----
 
-``AZURE_STORAGE_CONNECTION_STRING`` wins when set (Azurite in dev/CI,
-account-key deployments). Otherwise ``DefaultAzureCredential`` is used
-against ``AZURE_STORAGE_ACCOUNT_URL`` — managed identity in Azure, so no
-storage keys exist in the deployment. The identity needs the "Storage
-Blob Data Contributor" role assigned at **storage-account scope** (or
-above): Get User Delegation Key, which signs download links, is an
-account-level operation and is refused (403) under a container-scoped
-assignment, as is creating the container at startup.
+Exactly one of two modes; ``app.config`` refuses to load settings that
+name neither or both:
 
-Credential lifetime
--------------------
+* ``AZURE_STORAGE_CONNECTION_STRING`` — account key (Azurite in dev/CI,
+  account-key deployments). No Azure credential object is ever built.
+* ``AZURE_STORAGE_ACCOUNT_URL`` — ``DefaultAzureCredential``: managed
+  identity in Azure, so no storage keys exist in the deployment. The
+  identity needs the "Storage Blob Data Contributor" role assigned at
+  **storage-account scope** (or above): Get User Delegation Key, which
+  signs download links, is an account-level operation and is refused
+  (403) under a container-scoped assignment, as is creating the container
+  at startup. This mode has never been run against a real Azure account;
+  it is exercised only by unit tests with a fake credential and transport.
 
-Under credential auth one ``DefaultAzureCredential`` is shared by every
-call in the process, so tokens are cached and refreshed by the SDK rather
-than fetched from the identity endpoint per operation. The share is
-guarded (see ``_SharedCredential``): it is never used across event loops
-or a fork, it is dropped the moment the service reports an authentication
-failure (the next call starts from a fresh credential chain), it is
-recycled after ``CREDENTIAL_MAX_AGE_SECONDS`` regardless, and a dropped
-credential is closed only once its last in-flight call has finished.
-Connection-string auth never touches it.
+Client lifetime
+---------------
+
+One ``BlobServiceClient`` (and, under managed identity, its credential)
+serves every call in the process, so connections are pooled and tokens
+are cached and refreshed by the SDK. ``_SharedClient`` holds it together
+with the guards that make sharing safe: it is never used from another
+event loop or a forked process, it is discarded when the SDK reports an
+authentication failure (the next call builds a fresh client and
+credential), and a discarded client is closed only after its last
+in-flight call has finished. ``close_client`` closes it at shutdown.
+
+Errors
+------
+
+Backend failures surface as :class:`app.errors.InternalError` chained
+from the SDK error, after one structured log line (``_backend_errors``).
+:class:`PayloadTooLarge` passes through; a 404 on delete is success.
+Errors raised while a caller iterates a download stream are not
+translated — the same as on the S3 path.
 
 Retries
 -------
 
-The SDK's default retry policy backs off 15 s and up between attempts, so
-an unreachable account would hold a request (and startup) for well over a
-minute. The client is built with ``_CLIENT_OPTIONS`` — the same three
-retries, backing off in seconds — and the readiness check makes a single
-attempt under a hard ``READINESS_TIMEOUT_SECONDS`` deadline.
+``_CLIENT_OPTIONS`` documents the retry schedule and what it costs when
+the account is unreachable. The readiness check makes a single attempt
+(``retry_total=0`` on the call) under ``READINESS_TIMEOUT_SECONDS``.
 """
 
 from __future__ import annotations
@@ -61,13 +72,13 @@ import base64
 import hashlib
 import logging
 import os
-import time
-from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from collections.abc import AsyncIterator, Iterator
+from contextlib import asynccontextmanager, contextmanager
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from azure.core.exceptions import (
+    AzureError,
     ClientAuthenticationError,
     ResourceExistsError,
     ResourceNotFoundError,
@@ -81,7 +92,7 @@ from azure.storage.blob import (
 from azure.storage.blob.aio import BlobServiceClient
 
 from app.config import get_settings
-from app.errors import InternalError, PayloadTooLarge
+from app.errors import InternalError, LQAIError, PayloadTooLarge
 from app.storage import MULTIPART_PART_SIZE, StreamUploadResult
 
 log = logging.getLogger(__name__)
@@ -93,25 +104,53 @@ MAX_SAS_SECONDS = 7 * 24 * 60 * 60
 # Clock-skew allowance on SAS start times.
 SAS_CLOCK_SKEW = timedelta(minutes=5)
 
-# Client-wide transport/retry tuning. The SDK defaults (initial_backoff=15,
-# increment_base=3) wait 15 s, 18 s and 24 s (± jitter) between attempts —
-# measured at 85 s before a connection-refused error surfaced, against
-# ~3.5 s on the S3 path. Keep the retry count; back off in seconds.
+# Client-wide transport/retry tuning.
+#
+# The storage SDK's ExponentialRetry sleeps
+# ``initial_backoff + increment_base ** n`` seconds (± ``random_jitter_range``)
+# before retry n = 1, 2, 3. The exponent starts at 1, not 0: the retry
+# counter is incremented before the sleep is computed (``increment`` in
+# azure/storage/blob/_shared/policies.py, ``get_backoff_time`` in
+# policies_async.py). So:
+#
+# * SDK defaults (15, 3, jitter 3) sleep 18 + 24 + 42 = 84 s. Measured
+#   against a closed loopback port: 85 s and 90 s before the error surfaced.
+# * The earlier tuning here (1, 2, jitter 1) slept 3 + 5 + 9 = 17 s, not the
+#   1 + 2 + 4 it was written for. Measured: 16.5 s.
+# * These values (0, 2, jitter 1) sleep 2 + 4 + 8 = 14 s, 11-17 s with
+#   jitter — the shortest doubling schedule the policy can express.
+#   Measured: 12.9-14.5 s over five runs.
+#
+# An authentication error raised by the credential is retried on the same
+# schedule (the retry policy sits outside the credential policy): measured
+# 14.4 s for one call with no identity available.
+#
+# ``connection_timeout`` bounds each connection attempt, so a host that
+# drops packets instead of refusing can add up to 4 x 10 s to the sleeps.
+# That case has not been measured.
 _CLIENT_OPTIONS: dict[str, Any] = {
     "retry_total": 3,
-    "initial_backoff": 1,
+    "initial_backoff": 0,
     "increment_base": 2,
     "random_jitter_range": 1,
     "connection_timeout": 10,
 }
 
-# Upper bound on how long one shared credential object is reused. Tokens
-# refresh themselves well inside this; the cap only bounds how long a
-# stale credential chain (e.g. after an identity change) can linger.
-CREDENTIAL_MAX_AGE_SECONDS = 12 * 60 * 60
-
-# Hard ceiling on the readiness check, covering credential acquisition as
-# well as the storage call. /ready is polled; it must answer promptly.
+# Deadline for the readiness check, covering credential acquisition as
+# well as the storage call. Derived from what else bounds GET /ready:
+#
+# * /ready gathers its four checks and answers when the slowest returns.
+#   The only sibling with an explicit bound is the gateway check, 5.0 s
+#   (``health_check`` in app/clients/gateway.py); ``check_db`` and
+#   ``check_redis`` set none. Matching it means storage never holds /ready
+#   open longer than the gateway check already can.
+# * The Helm readinessProbe for the api polls /ready every 10 s
+#   (``periodSeconds``) and sets no ``timeoutSeconds``, so the kubelet
+#   gives up after the Kubernetes default of 1 s. 5 s ends well inside one
+#   period. It is deliberately not lowered to 1 s: a check cancelled there
+#   abandons a slow first token request and starts it again on the next
+#   poll, where 5 s lets it finish and be cached.
+# * docker-compose's api healthcheck calls /health, not /ready.
 READINESS_TIMEOUT_SECONDS = 5.0
 
 
@@ -125,151 +164,192 @@ def _block_id(n: int) -> str:
     return base64.b64encode(f"{n:08d}".encode()).decode()
 
 
-class _SharedCredential:
-    """A process-wide ``DefaultAzureCredential`` plus the state that makes
-    sharing it safe: where it was created, how many calls hold it, and
-    whether it has been retired."""
+class _SharedClient:
+    """The process-wide ``BlobServiceClient``, the credential it owns (managed
+    identity only), and the state that makes sharing them safe."""
 
-    def __init__(self, credential: Any) -> None:
+    def __init__(self, service: BlobServiceClient, credential: Any = None) -> None:
+        self.service = service
         self.credential = credential
         self.loop = asyncio.get_running_loop()
         self.pid = os.getpid()
-        self.created_at = time.monotonic()
         self.users = 0
-        self.retired = False
+        self.discarded = False
         self.closed = False
 
     def usable(self) -> bool:
-        """True while this credential may be handed to a new call."""
+        """True while this client may be handed to a new call."""
 
         return (
-            not self.retired
+            not self.discarded
             and self.pid == os.getpid()
             and self.loop is asyncio.get_running_loop()
-            and time.monotonic() - self.created_at < CREDENTIAL_MAX_AGE_SECONDS
         )
 
     async def close_if_idle(self) -> None:
-        """Close a retired credential once nothing is using it. Never raises."""
+        """Close a discarded client once no call is using it. Never raises."""
 
-        if not self.retired or self.users > 0 or self.closed:
+        if not self.discarded or self.users > 0 or self.closed:
             return
         self.closed = True
-        if self.pid != os.getpid() or self.loop.is_closed():
-            return  # its sessions belong to another process/loop; just drop it
-        if self.loop is not asyncio.get_running_loop():
-            return
-        try:
-            await self.credential.close()
-        except Exception as exc:
-            log.warning("Closing Azure credential failed: %r", exc)
+        if self.pid != os.getpid() or self.loop is not asyncio.get_running_loop():
+            return  # its connections belong to another process/loop: drop, don't await
+        for resource in (self.service, self.credential):
+            if resource is None:
+                continue
+            try:
+                await resource.close()
+            except Exception as exc:
+                log.warning("Closing Azure Blob client failed: %s", _summary(exc))
 
 
-_shared: _SharedCredential | None = None
+_client: _SharedClient | None = None
 
 
-def _is_auth_failure(exc: BaseException) -> bool:
-    """True if ``exc`` — or the error it wraps — is an authentication failure.
-
-    The public functions re-raise SDK errors as :class:`InternalError`
-    ``from`` the original, so the cause chain is checked too.
-    """
-
-    seen: set[int] = set()
-    current: BaseException | None = exc
-    while current is not None and id(current) not in seen:
-        if isinstance(current, ClientAuthenticationError):
-            return True
-        seen.add(id(current))
-        current = current.__cause__ or current.__context__
-    return False
-
-
-@asynccontextmanager
-async def _shared_credential() -> AsyncIterator[Any]:
-    """Lend out the shared credential for the duration of one storage call."""
-
-    global _shared
-
-    holder = _shared
-    if holder is None or not holder.usable():
-        stale = holder
+def _build_client() -> _SharedClient:
+    settings = get_settings()
+    if not log.isEnabledFor(logging.DEBUG):
+        # At INFO the SDK logs every request's URL and headers, and
+        # azure-identity logs the whole credential chain on each failed
+        # token request. This module logs one line per failure instead.
+        logging.getLogger("azure.core.pipeline.policies.http_logging_policy").setLevel(
+            logging.WARNING
+        )
+        logging.getLogger("azure.identity").setLevel(logging.ERROR)
+    try:
+        if settings.azure_storage_connection_string:
+            return _SharedClient(
+                BlobServiceClient.from_connection_string(
+                    settings.azure_storage_connection_string, **_CLIENT_OPTIONS
+                )
+            )
         # Imported lazily: azure-identity is only needed for credential auth.
         from azure.identity.aio import DefaultAzureCredential
 
-        # Swap before awaiting anything, so concurrent callers that arrive
-        # while the stale credential closes all see the same replacement.
-        holder = _SharedCredential(DefaultAzureCredential())
-        _shared = holder
-        if stale is not None:
-            stale.retired = True
-            await stale.close_if_idle()
+        credential = DefaultAzureCredential()
+        return _SharedClient(
+            BlobServiceClient(
+                settings.azure_storage_account_url, credential=credential, **_CLIENT_OPTIONS
+            ),
+            credential,
+        )
+    except Exception as exc:
+        # e.g. a malformed connection string; the SDK's message names no secrets.
+        log.warning("Azure Blob client could not be built: %s", _summary(exc))
+        raise InternalError("Azure Blob storage is misconfigured") from exc
 
+
+@asynccontextmanager
+async def blob_service_client() -> AsyncIterator[BlobServiceClient]:
+    """Lend out the shared ``BlobServiceClient`` for one storage call.
+
+    Tests substitute a fake backend by patching this name with a
+    zero-argument async context manager that yields the fake service.
+    """
+
+    global _client
+
+    holder = _client
+    if holder is None or not holder.usable():
+        # The replaced client is either discarded (its last user closes it)
+        # or belongs to another loop/process (dropped without awaiting).
+        holder = _client = _build_client()
     holder.users += 1
     try:
-        yield holder.credential
-    except BaseException as exc:
-        if _is_auth_failure(exc) and not holder.retired:
-            # Do not keep serving from a credential the service has refused:
-            # the next call rebuilds the chain from scratch.
-            holder.retired = True
-            if _shared is holder:
-                _shared = None
-            log.warning(
-                "Azure credential rejected; discarding the cached credential",
-                extra={"event": "storage_credential_discarded"},
-            )
-        raise
+        yield holder.service
     finally:
         holder.users -= 1
         await holder.close_if_idle()
 
 
-async def close_shared_credential() -> None:
-    """Retire and close the shared credential (process shutdown). Idempotent."""
+async def close_client() -> None:
+    """Close the shared client and its credential (process shutdown). Idempotent."""
 
-    global _shared
+    global _client
 
-    holder, _shared = _shared, None
+    holder, _client = _client, None
     if holder is not None:
-        holder.retired = True
+        holder.discarded = True
         await holder.close_if_idle()
 
 
-@asynccontextmanager
-async def blob_service_client(*, fail_fast: bool = False) -> AsyncIterator[BlobServiceClient]:
-    """Yield a configured async ``BlobServiceClient``; close it on exit.
+def _summary(exc: BaseException) -> str:
+    """One line for the log: exception type and the first line of its message."""
 
-    ``fail_fast`` disables retries — for the readiness probe, where a quick
-    "no" beats a late answer.
+    lines = str(exc).strip().splitlines()
+    return f"{type(exc).__name__}: {lines[0]}" if lines else type(exc).__name__
+
+
+def _discard_on_auth_failure(service: object, exc: BaseException) -> bool:
+    """Discard the shared client if ``exc`` is an authentication failure on it.
+
+    The next call then builds a fresh client and credential instead of
+    reusing one the service (or the identity endpoint) has refused; the
+    discarded one is closed when the last call using it returns.
+    Authorization failures (403, missing role) are ``HttpResponseError`` and
+    do not match.
     """
 
-    settings = get_settings()
-    options = {**_CLIENT_OPTIONS, "retry_total": 0} if fail_fast else _CLIENT_OPTIONS
-    if settings.azure_storage_connection_string:
-        async with BlobServiceClient.from_connection_string(
-            settings.azure_storage_connection_string, **options
-        ) as service:
-            yield service
-        return
-
-    if not settings.azure_storage_account_url:
-        raise InternalError(
-            "Azure Blob storage is selected but not configured",
-            details={
-                "required": "AZURE_STORAGE_ACCOUNT_URL or AZURE_STORAGE_CONNECTION_STRING",
-            },
-        )
-
-    # Closing the service client closes its own transport only; the shared
-    # credential outlives it (released, not closed, on exit).
-    async with (
-        _shared_credential() as credential,
-        BlobServiceClient(
-            settings.azure_storage_account_url, credential=credential, **options
-        ) as service,
+    holder = _client
+    if (
+        isinstance(exc, ClientAuthenticationError)
+        and holder is not None
+        and holder.service is service
+        and not holder.discarded
     ):
-        yield service
+        holder.discarded = True
+        return True
+    return False
+
+
+@contextmanager
+def _backend_errors(
+    service: object, message: str, *, event: str, storage_path: str | None = None
+) -> Iterator[None]:
+    """Turn any backend failure in the block into a logged ``InternalError``.
+
+    The single place SDK errors are caught, so it is also where an
+    authentication failure discards the shared client. Typed application
+    errors (``PayloadTooLarge``, ``InternalError``) pass through.
+    """
+
+    try:
+        yield
+    except LQAIError:
+        raise
+    except Exception as exc:
+        discarded = _discard_on_auth_failure(service, exc)
+        # SDK errors describe themselves in one line (their full text can run
+        # to a screenful); anything else is unexpected and keeps its traceback.
+        expected = isinstance(exc, AzureError)
+        log.warning(
+            "%s: %s%s",
+            message,
+            _summary(exc),
+            " (shared client discarded)" if discarded else "",
+            extra={
+                "event": event,
+                "container": get_settings().azure_storage_container,
+                "storage_path": storage_path,
+            },
+            exc_info=not expected,
+        )
+        if expected:
+            log.debug("%s: full error", message, exc_info=True)
+        details = {"storage_path": storage_path} if storage_path is not None else None
+        raise InternalError(message, details=details) from exc
+
+
+def _account_key(connection_string: str) -> str:
+    """Return the ``AccountKey`` of a storage connection string."""
+
+    for part in connection_string.split(";"):
+        name, _, value = part.partition("=")
+        if name.strip().lower() == "accountkey" and value.strip():
+            return value.strip()
+    raise InternalError(
+        "Cannot sign a download link: the storage connection string has no AccountKey"
+    )
 
 
 async def ensure_container() -> None:
@@ -277,29 +357,40 @@ async def ensure_container() -> None:
 
     container_name = get_settings().azure_storage_container
     async with blob_service_client() as service:
-        try:
-            await service.get_container_client(container_name).create_container()
-            log.info("Created Azure Blob container: %s", container_name)
-        except ResourceExistsError:
-            return
+        with _backend_errors(
+            service, "Failed to create the storage container", event="storage_ensure_failed"
+        ):
+            try:
+                await service.get_container_client(container_name).create_container()
+            except ResourceExistsError:
+                return
+        log.info("Created Azure Blob container: %s", container_name)
 
 
 async def check_storage() -> bool:
     """Readiness check: True if the configured container is reachable.
 
     One attempt, bounded by ``READINESS_TIMEOUT_SECONDS``; never raises.
+    Polled, so a failure logs one WARNING line (full detail at DEBUG).
     """
 
     container_name = get_settings().azure_storage_container
     try:
-        async with (
-            asyncio.timeout(READINESS_TIMEOUT_SECONDS),
-            blob_service_client(fail_fast=True) as service,
-        ):
-            await service.get_container_client(container_name).get_container_properties()
+        async with asyncio.timeout(READINESS_TIMEOUT_SECONDS), blob_service_client() as service:
+            with _backend_errors(
+                service, "Storage readiness check failed", event="storage_readiness_failed"
+            ):
+                # retry_total=0 on the call overrides the client-wide retry count.
+                await service.get_container_client(container_name).get_container_properties(
+                    retry_total=0
+                )
         return True
-    except Exception as exc:
-        log.warning("Storage readiness check failed: %r", exc)
+    except InternalError:
+        return False  # already logged, by _backend_errors or _build_client
+    except TimeoutError:
+        log.warning(
+            "Storage readiness check failed: no answer within %g s", READINESS_TIMEOUT_SECONDS
+        )
         return False
 
 
@@ -332,13 +423,18 @@ async def stream_upload(
 
     async with blob_service_client() as service:
         blob = service.get_blob_client(container=container_name, blob=storage_path)
-        try:
 
-            async def _stage(data: bytes) -> None:
-                block_id = _block_id(len(block_ids))
-                await blob.stage_block(block_id=block_id, data=data, length=len(data))
-                block_ids.append(block_id)
+        async def _stage(data: bytes) -> None:
+            block_id = _block_id(len(block_ids))
+            await blob.stage_block(block_id=block_id, data=data, length=len(data))
+            block_ids.append(block_id)
 
+        with _backend_errors(
+            service,
+            "Failed to write uploaded file to object storage",
+            event="storage_stream_upload_failed",
+            storage_path=storage_path,
+        ):
             async for chunk in chunks:
                 if not chunk:
                     continue
@@ -372,21 +468,6 @@ async def stream_upload(
                 [BlobBlock(block_id=block_id) for block_id in block_ids],
                 content_settings=ContentSettings(content_type=content_type),
             )
-        except PayloadTooLarge:
-            raise
-        except Exception as exc:
-            log.exception(
-                "stream_upload failed",
-                extra={
-                    "event": "storage_stream_upload_failed",
-                    "container": container_name,
-                    "storage_path": storage_path,
-                },
-            )
-            raise InternalError(
-                "Failed to write uploaded file to object storage",
-                details={"storage_path": storage_path},
-            ) from exc
 
     return StreamUploadResult(
         size_bytes=total_bytes,
@@ -399,28 +480,20 @@ async def stream_upload(
 async def stream_download(*, storage_path: str) -> AsyncIterator[AsyncIterator[bytes]]:
     """Open a streaming read of ``storage_path``; yield an async byte-iterator.
 
-    The iterator must be consumed inside the ``async with`` block.
+    The iterator must be consumed inside the ``async with`` block, which
+    also keeps the shared client open for the length of the stream.
     """
 
     container_name = get_settings().azure_storage_container
     async with blob_service_client() as service:
         blob = service.get_blob_client(container=container_name, blob=storage_path)
-        try:
+        with _backend_errors(
+            service,
+            "Failed to read uploaded file from object storage",
+            event="storage_get_object_failed",
+            storage_path=storage_path,
+        ):
             downloader = await blob.download_blob()
-        except Exception as exc:
-            log.warning(
-                "stream_download download_blob failed",
-                extra={
-                    "event": "storage_get_object_failed",
-                    "container": container_name,
-                    "storage_path": storage_path,
-                    "error": str(exc),
-                },
-            )
-            raise InternalError(
-                "Failed to read uploaded file from object storage",
-                details={"storage_path": storage_path},
-            ) from exc
 
         async def _iterate() -> AsyncIterator[bytes]:
             async for chunk in downloader.chunks():
@@ -440,21 +513,16 @@ async def delete_object(*, storage_path: str) -> None:
     container_name = get_settings().azure_storage_container
     async with blob_service_client() as service:
         blob = service.get_blob_client(container=container_name, blob=storage_path)
-        try:
-            await blob.delete_blob(delete_snapshots="include")
-        except ResourceNotFoundError:
-            return
-        except Exception as exc:
-            log.warning(
-                "delete_object failed",
-                extra={
-                    "event": "storage_delete_failed",
-                    "container": container_name,
-                    "storage_path": storage_path,
-                    "error": str(exc),
-                },
-            )
-            raise
+        with _backend_errors(
+            service,
+            "Failed to delete file from object storage",
+            event="storage_delete_failed",
+            storage_path=storage_path,
+        ):
+            try:
+                await blob.delete_blob(delete_snapshots="include")
+            except ResourceNotFoundError:
+                return  # Already gone; idempotent success.
 
 
 async def upload_bytes(*, storage_path: str, body: bytes, content_type: str) -> None:
@@ -463,19 +531,26 @@ async def upload_bytes(*, storage_path: str, body: bytes, content_type: str) -> 
     container_name = get_settings().azure_storage_container
     async with blob_service_client() as service:
         blob = service.get_blob_client(container=container_name, blob=storage_path)
-        await blob.upload_blob(
-            body,
-            overwrite=True,
-            content_settings=ContentSettings(content_type=content_type),
-        )
+        with _backend_errors(
+            service,
+            "Failed to write file to object storage",
+            event="storage_upload_bytes_failed",
+            storage_path=storage_path,
+        ):
+            await blob.upload_blob(
+                body,
+                overwrite=True,
+                content_settings=ContentSettings(content_type=content_type),
+            )
 
 
 async def presigned_get_url(*, storage_path: str, expires_in_seconds: int) -> str:
     """Return a read-only SAS URL for ``storage_path``.
 
-    Signed with a user delegation key under credential auth, or with the
-    account key under a connection string. ``expires_in_seconds`` is
-    clamped to the 7-day service ceiling.
+    The signing mode follows the configured auth mode: the account key
+    under a connection string, a user delegation key under managed
+    identity. ``expires_in_seconds`` is clamped to the 7-day service
+    ceiling.
     """
 
     settings = get_settings()
@@ -485,31 +560,38 @@ async def presigned_get_url(*, storage_path: str, expires_in_seconds: int) -> st
     expiry = now + timedelta(seconds=min(expires_in_seconds, MAX_SAS_SECONDS))
 
     async with blob_service_client() as service:
-        blob = service.get_blob_client(container=container_name, blob=storage_path)
-        account_name = service.account_name
-        if not account_name:
-            # The SDK derives this from the endpoint; a custom domain can hide it.
-            raise InternalError(
-                "Cannot sign a download link: storage account name is unknown",
-                details={"storage_path": storage_path},
-            )
-        sign_kwargs: dict[str, Any]
-        account_key = getattr(service.credential, "account_key", None)
-        if account_key:
-            sign_kwargs = {"account_key": account_key}
-        else:
-            delegation_key = await service.get_user_delegation_key(
-                key_start_time=start, key_expiry_time=expiry
-            )
-            sign_kwargs = {"user_delegation_key": delegation_key}
+        with _backend_errors(
+            service,
+            "Failed to sign a download link",
+            event="storage_presign_failed",
+            storage_path=storage_path,
+        ):
+            blob = service.get_blob_client(container=container_name, blob=storage_path)
+            account_name = service.account_name
+            if not account_name:
+                # The SDK derives this from the endpoint; a custom domain can hide it.
+                raise InternalError(
+                    "Cannot sign a download link: storage account name is unknown",
+                    details={"storage_path": storage_path},
+                )
+            sign_kwargs: dict[str, Any]
+            if settings.azure_storage_connection_string:
+                sign_kwargs = {
+                    "account_key": _account_key(settings.azure_storage_connection_string)
+                }
+            else:
+                delegation_key = await service.get_user_delegation_key(
+                    key_start_time=start, key_expiry_time=expiry
+                )
+                sign_kwargs = {"user_delegation_key": delegation_key}
 
-        sas = generate_blob_sas(
-            account_name=account_name,
-            container_name=container_name,
-            blob_name=storage_path,
-            permission=BlobSasPermissions(read=True),
-            start=start,
-            expiry=expiry,
-            **sign_kwargs,
-        )
-        return f"{blob.url}?{sas}"
+            sas = generate_blob_sas(
+                account_name=account_name,
+                container_name=container_name,
+                blob_name=storage_path,
+                permission=BlobSasPermissions(read=True),
+                start=start,
+                expiry=expiry,
+                **sign_kwargs,
+            )
+            return f"{blob.url}?{sas}"

@@ -150,3 +150,54 @@ def test_assert_production_secrets_allows_real_secret(
     monkeypatch.delenv("LQ_AI_DEV_MODE", raising=False)
     s = Settings(_env_file=None)  # type: ignore[call-arg]
     assert_production_secrets(s)  # does not raise
+
+
+# ---------------------------------------------------------------------------
+# STORAGE_BACKEND=azureblob auth mode (managed fork, docs/managed/adr/M-0001)
+# ---------------------------------------------------------------------------
+
+_BLOB_URL = "https://account.blob.core.windows.net"
+_BLOB_CONNECTION_STRING = "DefaultEndpointsProtocol=https;AccountName=account;AccountKey=a2V5"
+
+
+def _blob_env(monkeypatch: pytest.MonkeyPatch, *, backend: str, url: str, conn: str) -> None:
+    monkeypatch.setenv("STORAGE_BACKEND", backend)
+    monkeypatch.setenv("AZURE_STORAGE_ACCOUNT_URL", url)
+    monkeypatch.setenv("AZURE_STORAGE_CONNECTION_STRING", conn)
+
+
+@pytest.mark.unit
+def test_azureblob_requires_an_auth_setting(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Regression: this used to surface only on the first storage call."""
+    _blob_env(monkeypatch, backend="azureblob", url="", conn="")
+    with pytest.raises(RuntimeError, match="requires AZURE_STORAGE_ACCOUNT_URL"):
+        Settings(_env_file=None)  # type: ignore[call-arg]
+
+
+@pytest.mark.unit
+def test_azureblob_refuses_both_auth_settings(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Regression: the connection string used to win silently."""
+    _blob_env(monkeypatch, backend="azureblob", url=_BLOB_URL, conn=_BLOB_CONNECTION_STRING)
+    with pytest.raises(RuntimeError, match="accepts only one of") as exc_info:
+        Settings(_env_file=None)  # type: ignore[call-arg]
+    # A pydantic ValidationError would print every input, account key included.
+    assert "AccountKey" not in str(exc_info.value)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(("url", "conn"), [(_BLOB_URL, ""), ("", _BLOB_CONNECTION_STRING)])
+def test_azureblob_accepts_exactly_one_auth_setting(
+    monkeypatch: pytest.MonkeyPatch, url: str, conn: str
+) -> None:
+    _blob_env(monkeypatch, backend="azureblob", url=url, conn=conn)
+    s = Settings(_env_file=None)  # type: ignore[call-arg]
+    assert s.storage_backend == "azureblob"
+
+
+@pytest.mark.unit
+def test_s3_backend_ignores_azure_settings(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The check applies only when the Blob backend is selected."""
+    _blob_env(monkeypatch, backend="s3", url=_BLOB_URL, conn=_BLOB_CONNECTION_STRING)
+    assert Settings(_env_file=None).storage_backend == "s3"  # type: ignore[call-arg]
+    _blob_env(monkeypatch, backend="s3", url="", conn="")
+    assert Settings(_env_file=None).storage_backend == "s3"  # type: ignore[call-arg]

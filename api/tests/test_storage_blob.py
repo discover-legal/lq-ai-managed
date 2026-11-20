@@ -1,9 +1,18 @@
 """Unit tests for the Azure Blob storage backend (managed fork).
 
-``app.storage_blob.blob_service_client`` is patched to yield an in-memory
-fake, and ``STORAGE_BACKEND=azureblob`` is set, so every test drives the
-public :mod:`app.storage` API through the dispatch hook — the same entry
-points the handlers and workers use.
+Every test sets ``STORAGE_BACKEND=azureblob`` and drives the public
+:mod:`app.storage` API through the dispatch hook — the same entry points
+the handlers and workers use. Two levels of fake:
+
+* **Data-plane tests** patch ``app.storage_blob.blob_service_client`` (a
+  zero-argument async context manager) to yield ``FakeBlobService``, an
+  in-memory stand-in for the SDK surface the backend calls.
+* **Client-lifetime tests** (``real_client`` fixture) keep the real
+  ``BlobServiceClient`` and its real pipeline — retry policy, bearer-token
+  policy, error mapping — and fake only the network (``_FakeTransport``,
+  injected through ``storage_blob._CLIENT_OPTIONS["transport"]``) and the
+  credential (``azure.identity.aio.DefaultAzureCredential`` patched with
+  ``_FakeCredential``).
 
 What's covered:
 
@@ -11,13 +20,16 @@ What's covered:
   block IDs, empty body, content type.
 * The 413 branch and mid-upload failures: nothing is committed.
 * Streaming download, missing-blob error, idempotent delete, single-shot
-  upload.
+  upload; every backend failure surfaces as ``InternalError``.
 * SAS generation with an account key and with a user delegation key,
-  including the 7-day clamp.
-* Container bootstrap, readiness, and the missing-configuration error.
+  chosen from settings, including the 7-day clamp.
+* Container bootstrap and readiness: single attempt, deadline, one log line.
+* The shared client: built once, never shared across loops or a fork,
+  discarded on authentication failure only, closed after its last user and
+  at shutdown.
 
-Round-trip against a real Blob endpoint (Azurite) is in
-``test_storage_blob_azurite.py``.
+The auth-mode validation is tested in ``test_config.py``. Round-trip against
+a real Blob endpoint (Azurite) is in ``test_storage_blob_azurite.py``.
 """
 
 from __future__ import annotations
@@ -25,9 +37,11 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import logging
+import os
 import socket
 import time
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Any, ClassVar
@@ -35,12 +49,16 @@ from unittest.mock import patch
 from urllib.parse import parse_qs, urlparse
 
 import pytest
+from azure.core.credentials import AccessToken
 from azure.core.exceptions import (
     ClientAuthenticationError,
+    HttpResponseError,
     ResourceExistsError,
     ResourceNotFoundError,
+    ServiceRequestError,
 )
-from azure.storage.blob import UserDelegationKey
+from azure.core.pipeline.transport import AsyncHttpResponse, AsyncHttpTransport, HttpRequest
+from azure.storage.blob import BlobSasPermissions, UserDelegationKey, generate_blob_sas
 
 from app import storage_blob
 from app.config import get_settings
@@ -61,8 +79,13 @@ from app.storage import (
 CONTAINER = "test-files"
 ACCOUNT = "fakeaccount"
 ACCOUNT_KEY = base64.b64encode(b"k" * 64).decode()
+ACCOUNT_URL = f"https://{ACCOUNT}.blob.core.windows.net"
+CONNECTION_STRING = (
+    f"DefaultEndpointsProtocol=https;AccountName={ACCOUNT};AccountKey={ACCOUNT_KEY};"
+    "EndpointSuffix=core.windows.net"
+)
 
-# The real client builder, captured before the autouse fixture patches it.
+# The real client lender, captured before the autouse fixture patches it.
 _REAL_BLOB_SERVICE_CLIENT = storage_blob.blob_service_client
 
 # ---------------------------------------------------------------------------
@@ -108,6 +131,7 @@ class _FakeBlobClient:
         return _FakeDownloader(self._store.blobs[self._name])
 
     async def delete_blob(self, *, delete_snapshots: str) -> None:
+        self._store.maybe_fail("delete_blob")
         self._store.events.append(("delete_blob", delete_snapshots))
         if self._name not in self._store.blobs:
             raise ResourceNotFoundError("BlobNotFound")
@@ -115,6 +139,7 @@ class _FakeBlobClient:
 
     async def upload_blob(self, data: bytes, *, overwrite: bool, content_settings: Any) -> None:
         assert overwrite is True
+        self._store.maybe_fail("upload_blob")
         self._store.blobs[self._name] = data
         self._store.content_types[self._name] = content_settings.content_type
 
@@ -125,21 +150,26 @@ class _FakeContainerClient:
         self._name = name
 
     async def create_container(self) -> None:
+        self._store.maybe_fail("create_container")
         if self._name in self._store.containers:
             raise ResourceExistsError("ContainerAlreadyExists")
         self._store.containers.add(self._name)
 
-    async def get_container_properties(self) -> dict[str, Any]:
+    async def get_container_properties(self, **kwargs: Any) -> dict[str, Any]:
+        self._store.events.append(("get_container_properties", kwargs))
         if self._name not in self._store.containers:
             raise ResourceNotFoundError("ContainerNotFound")
         return {"name": self._name}
 
 
-class _AccountKeyCredential:
-    account_key = ACCOUNT_KEY
-
-
 class FakeBlobService:
+    """In-memory stand-in for ``BlobServiceClient``.
+
+    Deliberately has no ``credential`` attribute: the backend must not read
+    SDK internals to decide how to sign. Set ``fail[<sdk method>]`` to make
+    that call raise.
+    """
+
     account_name = ACCOUNT
 
     def __init__(self) -> None:
@@ -149,8 +179,12 @@ class FakeBlobService:
         self.containers: set[str] = set()
         self.events: list[tuple[str, Any]] = []
         self.fail_stage_at: int | None = None
-        self.credential: Any = _AccountKeyCredential()
+        self.fail: dict[str, Exception] = {}
         self.delegation_requests: list[tuple[datetime, datetime]] = []
+
+    def maybe_fail(self, method: str) -> None:
+        if method in self.fail:
+            raise self.fail[method]
 
     def get_blob_client(self, *, container: str, blob: str) -> _FakeBlobClient:
         assert container == CONTAINER
@@ -162,6 +196,7 @@ class FakeBlobService:
     async def get_user_delegation_key(
         self, *, key_start_time: datetime, key_expiry_time: datetime
     ) -> UserDelegationKey:
+        self.maybe_fail("get_user_delegation_key")
         self.delegation_requests.append((key_start_time, key_expiry_time))
         key = UserDelegationKey()
         key.signed_oid = "00000000-0000-0000-0000-000000000001"
@@ -183,16 +218,30 @@ def fake_blob() -> FakeBlobService:
 def _azureblob_backend(
     monkeypatch: pytest.MonkeyPatch, fake_blob: FakeBlobService
 ) -> Iterator[None]:
+    """Blob backend with connection-string auth, served by ``fake_blob``."""
+
     monkeypatch.setenv("STORAGE_BACKEND", "azureblob")
     monkeypatch.setenv("AZURE_STORAGE_CONTAINER", CONTAINER)
+    monkeypatch.setenv("AZURE_STORAGE_CONNECTION_STRING", CONNECTION_STRING)
+    monkeypatch.delenv("AZURE_STORAGE_ACCOUNT_URL", raising=False)
+    monkeypatch.setattr(storage_blob, "_client", None)
     get_settings.cache_clear()
 
     @asynccontextmanager
-    async def _ctx(*, fail_fast: bool = False) -> AsyncIterator[FakeBlobService]:
+    async def _ctx() -> AsyncIterator[FakeBlobService]:
         yield fake_blob
 
     with patch("app.storage_blob.blob_service_client", _ctx):
         yield
+    get_settings.cache_clear()
+
+
+@pytest.fixture
+def managed_identity(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Switch the settings to managed-identity auth (account URL, no key)."""
+
+    monkeypatch.delenv("AZURE_STORAGE_CONNECTION_STRING", raising=False)
+    monkeypatch.setenv("AZURE_STORAGE_ACCOUNT_URL", ACCOUNT_URL)
     get_settings.cache_clear()
 
 
@@ -358,21 +407,36 @@ def _query(url: str) -> dict[str, list[str]]:
 
 
 @pytest.mark.unit
-async def test_presigned_url_with_account_key_is_read_only() -> None:
+async def test_presigned_url_with_connection_string_signs_with_account_key(
+    fake_blob: FakeBlobService,
+) -> None:
+    """Regression: the mode used to be read off ``service.credential.account_key``
+    (an SDK internal — the fake has no ``credential`` at all)."""
+
     url = await presigned_get_url(storage_path="export.zip", expires_in_seconds=3600)
 
     assert url.startswith(f"https://{ACCOUNT}.blob.core.windows.net/{CONTAINER}/export.zip?")
     q = _query(url)
     assert q["sp"] == ["r"]
-    assert "sig" in q
     assert "skoid" not in q  # account-key SAS, not user-delegation
+    assert fake_blob.delegation_requests == []
+    # The signature is the one the connection string's AccountKey produces.
+    expected = generate_blob_sas(
+        account_name=ACCOUNT,
+        container_name=CONTAINER,
+        blob_name="export.zip",
+        account_key=ACCOUNT_KEY,
+        permission=BlobSasPermissions(read=True),
+        start=q["st"][0],
+        expiry=q["se"][0],
+    )
+    assert q["sig"] == parse_qs(expected)["sig"]
 
 
 @pytest.mark.unit
-async def test_presigned_url_with_credential_uses_user_delegation_key(
-    fake_blob: FakeBlobService,
+async def test_presigned_url_with_managed_identity_uses_user_delegation_key(
+    managed_identity: None, fake_blob: FakeBlobService
 ) -> None:
-    fake_blob.credential = object()  # token credential: no account_key
     url = await presigned_get_url(storage_path="export.zip", expires_in_seconds=24 * 3600)
 
     q = _query(url)
@@ -383,9 +447,8 @@ async def test_presigned_url_with_credential_uses_user_delegation_key(
 
 @pytest.mark.unit
 async def test_presigned_url_expiry_is_clamped_to_seven_days(
-    fake_blob: FakeBlobService,
+    managed_identity: None, fake_blob: FakeBlobService
 ) -> None:
-    fake_blob.credential = object()
     await presigned_get_url(storage_path="x", expires_in_seconds=30 * 24 * 3600)
 
     start, expiry = fake_blob.delegation_requests[0]
@@ -393,8 +456,16 @@ async def test_presigned_url_expiry_is_clamped_to_seven_days(
     assert window <= storage_blob.MAX_SAS_SECONDS + storage_blob.SAS_CLOCK_SKEW.total_seconds()
 
 
+@pytest.mark.unit
+def test_account_key_is_parsed_from_the_connection_string() -> None:
+    # Keys are case-insensitive; the base64 value keeps its own "=" padding.
+    assert storage_blob._account_key("AccountName=a;accountkey=abc==;") == "abc=="
+    with pytest.raises(InternalError, match="no AccountKey"):
+        storage_blob._account_key("BlobEndpoint=https://a.example;SharedAccessSignature=sig=x")
+
+
 # ---------------------------------------------------------------------------
-# container bootstrap / readiness / configuration
+# container bootstrap / readiness
 # ---------------------------------------------------------------------------
 
 
@@ -410,13 +481,475 @@ async def test_check_storage_reports_reachability(fake_blob: FakeBlobService) ->
     assert await check_storage() is False
     fake_blob.containers.add(CONTAINER)
     assert await check_storage() is True
+    # The no-retry override travels on the call, not on a separate client.
+    assert ("get_container_properties", {"retry_total": 0}) in fake_blob.events
+
+
+@pytest.mark.unit
+async def test_check_storage_gives_up_at_the_deadline(
+    monkeypatch: pytest.MonkeyPatch, fake_blob: FakeBlobService
+) -> None:
+    async def _hang(self: _FakeContainerClient, **kwargs: Any) -> dict[str, Any]:
+        await asyncio.sleep(60)
+        return {}
+
+    monkeypatch.setattr(_FakeContainerClient, "get_container_properties", _hang)
+    monkeypatch.setattr(storage_blob, "READINESS_TIMEOUT_SECONDS", 0.05)
+    fake_blob.containers.add(CONTAINER)
+
+    assert await check_storage() is False
+
+
+# ---------------------------------------------------------------------------
+# error translation
+# ---------------------------------------------------------------------------
+
+
+def _storage_log(caplog: pytest.LogCaptureFixture, level: int) -> list[logging.LogRecord]:
+    return [r for r in caplog.records if r.name == "app.storage_blob" and r.levelno == level]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("sdk_method", "call", "event"),
+    [
+        (
+            "delete_blob",
+            lambda: delete_object(storage_path="k"),
+            "storage_delete_failed",
+        ),
+        (
+            "upload_blob",
+            lambda: upload_bytes(storage_path="k", body=b"x", content_type="text/plain"),
+            "storage_upload_bytes_failed",
+        ),
+        (
+            "get_user_delegation_key",
+            lambda: presigned_get_url(storage_path="k", expires_in_seconds=60),
+            "storage_presign_failed",
+        ),
+        ("create_container", lambda: ensure_bucket(), "storage_ensure_failed"),
+    ],
+)
+async def test_backend_failures_surface_as_internal_error(
+    managed_identity: None,
+    fake_blob: FakeBlobService,
+    caplog: pytest.LogCaptureFixture,
+    sdk_method: str,
+    call: Callable[[], Awaitable[object]],
+    event: str,
+) -> None:
+    """Regression: these three used to leak raw Azure SDK exceptions."""
+
+    raw = HttpResponseError("service said no\nwith a second line of detail")
+    fake_blob.fail[sdk_method] = raw
+
+    with (
+        caplog.at_level(logging.WARNING, logger="app.storage_blob"),
+        pytest.raises(InternalError) as exc_info,
+    ):
+        await call()
+
+    assert exc_info.value.__cause__ is raw
+    [record] = _storage_log(caplog, logging.WARNING)
+    assert record.__dict__["event"] == event
+    assert record.getMessage().endswith("HttpResponseError: service said no")
+    assert not record.exc_info
+
+
+@pytest.mark.unit
+async def test_unexpected_errors_keep_their_traceback(
+    fake_blob: FakeBlobService, caplog: pytest.LogCaptureFixture
+) -> None:
+    fake_blob.fail["upload_blob"] = RuntimeError("a bug, not a backend answer")
+
+    with caplog.at_level(logging.WARNING, logger="app.storage_blob"), pytest.raises(InternalError):
+        await upload_bytes(storage_path="k", body=b"x", content_type="text/plain")
+
+    [record] = _storage_log(caplog, logging.WARNING)
+    assert record.exc_info
+
+
+# ---------------------------------------------------------------------------
+# the shared client — real BlobServiceClient, fake network and credential
+# ---------------------------------------------------------------------------
+
+# What DefaultAzureCredential raises with no identity available (abridged).
+_CHAIN_DUMP = (
+    "DefaultAzureCredential failed to retrieve a token from the included credentials.\n"
+    "Attempted credentials:\n"
+    "\tEnvironmentCredential: EnvironmentCredential authentication unavailable.\n"
+    "\tManagedIdentityCredential: ManagedIdentityCredential authentication unavailable."
+)
+
+_SUCCESS_STATUS = {"PUT": 201, "DELETE": 202}
+
+
+class _FakeResponse(AsyncHttpResponse):
+    """A bodiless success, or a storage XML error when ``error_code`` is given."""
+
+    def __init__(self, request: HttpRequest, status: int, error_code: str | None = None) -> None:
+        super().__init__(request, None)
+        self.status_code = status
+        self.reason = error_code or "OK"
+        self.headers = {}
+        self._body = b""
+        if error_code is not None:
+            self.headers = {"x-ms-error-code": error_code, "Content-Type": "application/xml"}
+            self._body = (
+                '<?xml version="1.0" encoding="utf-8"?>'
+                f"<Error><Code>{error_code}</Code><Message>fake</Message></Error>"
+            ).encode()
+        self.content_type = self.headers.get("Content-Type")
+
+    def body(self) -> bytes:
+        return self._body
+
+    async def load_body(self) -> None:
+        return None
+
+
+def _succeed(request: HttpRequest) -> _FakeResponse:
+    return _FakeResponse(request, _SUCCESS_STATUS.get(request.method, 200))
+
+
+def _answer(status: int, error_code: str) -> Callable[[HttpRequest], _FakeResponse]:
+    return lambda request: _FakeResponse(request, status, error_code)
+
+
+def _refuse_connection(request: HttpRequest) -> _FakeResponse:
+    raise ServiceRequestError("connection refused")
+
+
+class _FakeTransport(AsyncHttpTransport):
+    """The network: records each request and answers with ``respond``."""
+
+    def __init__(self) -> None:
+        self.requests: list[HttpRequest] = []
+        self.close_calls = 0
+        self.respond: Callable[[HttpRequest], _FakeResponse] = _succeed
+
+    async def open(self) -> None:
+        return None
+
+    async def close(self) -> None:
+        self.close_calls += 1
+
+    async def __aexit__(self, *args: Any) -> None:
+        await self.close()
+
+    async def send(self, request: HttpRequest, **kwargs: Any) -> _FakeResponse:
+        self.requests.append(request)
+        return self.respond(request)
+
+
+class _FakeCredential:
+    """Stands in for ``DefaultAzureCredential``; set ``error`` to refuse tokens."""
+
+    instances: ClassVar[list[_FakeCredential]] = []
+    error: ClassVar[Exception | None] = None
+
+    def __init__(self) -> None:
+        self.token_requests = 0
+        self.close_calls = 0
+        _FakeCredential.instances.append(self)
+
+    async def get_token(self, *scopes: str, **kwargs: Any) -> AccessToken:
+        self.token_requests += 1
+        if _FakeCredential.error is not None:
+            raise _FakeCredential.error
+        return AccessToken("fake-token", int(time.time()) + 3600)
+
+    async def close(self) -> None:
+        self.close_calls += 1
+
+
+@pytest.fixture
+async def real_client(monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[_FakeTransport]:
+    """Un-fake the client: the real ``BlobServiceClient`` over ``_FakeTransport``.
+
+    Connection-string auth by default; request ``managed_identity`` as well
+    for credential auth (``DefaultAzureCredential`` is ``_FakeCredential``).
+    """
+
+    transport = _FakeTransport()
+    monkeypatch.setitem(storage_blob._CLIENT_OPTIONS, "transport", transport)
+    # Backoff 0 + 0**n: the retry policy makes its attempts without sleeping.
+    monkeypatch.setitem(storage_blob._CLIENT_OPTIONS, "increment_base", 0)
+    monkeypatch.setitem(storage_blob._CLIENT_OPTIONS, "random_jitter_range", 0)
+    _FakeCredential.instances = []
+    _FakeCredential.error = None
+    with (
+        patch("azure.identity.aio.DefaultAzureCredential", _FakeCredential),
+        patch("app.storage_blob.blob_service_client", _REAL_BLOB_SERVICE_CLIENT),
+    ):
+        yield transport
+        await close_storage()
+
+
+@pytest.fixture
+def builds(monkeypatch: pytest.MonkeyPatch) -> list[storage_blob._SharedClient]:
+    """Every shared client built during the test, in order."""
+
+    built: list[storage_blob._SharedClient] = []
+    build = storage_blob._build_client
+
+    def _recording() -> storage_blob._SharedClient:
+        built.append(build())
+        return built[-1]
+
+    monkeypatch.setattr(storage_blob, "_build_client", _recording)
+    return built
+
+
+async def _upload() -> None:
+    await upload_bytes(storage_path="k", body=b"x", content_type="text/plain")
+
+
+@pytest.mark.unit
+async def test_one_client_serves_every_call(
+    real_client: _FakeTransport, builds: list[storage_blob._SharedClient]
+) -> None:
+    """Regression: a new client (and TCP/TLS handshake) was built per call."""
+
+    await ensure_bucket()
+    assert await check_storage() is True
+    await _upload()
+    await delete_object(storage_path="k")
+
+    assert len(builds) == 1
+    assert [r.method for r in real_client.requests] == ["PUT", "GET", "PUT", "DELETE"]
+    assert real_client.close_calls == 0  # left open for the next call
+
+
+@pytest.mark.unit
+async def test_connection_string_auth_never_builds_a_credential(
+    real_client: _FakeTransport, builds: list[storage_blob._SharedClient]
+) -> None:
+    await _upload()
+
+    assert _FakeCredential.instances == []
+    assert builds[0].credential is None
+    assert real_client.requests[0].headers["Authorization"].startswith("SharedKey ")
+
+
+@pytest.mark.unit
+async def test_managed_identity_shares_one_credential_and_one_token(
+    real_client: _FakeTransport,
+    builds: list[storage_blob._SharedClient],
+    managed_identity: None,
+) -> None:
+    await ensure_bucket()
+    assert await check_storage() is True
+    await _upload()
+
+    assert len(builds) == 1
+    [credential] = _FakeCredential.instances
+    assert builds[0].credential is credential
+    assert credential.token_requests == 1  # cached by the client's bearer-token policy
+    assert {r.headers["Authorization"] for r in real_client.requests} == {"Bearer fake-token"}
+    assert credential.close_calls == 0
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("refused_by", ["credential", "service"])
+async def test_authentication_failure_discards_client_and_credential(
+    real_client: _FakeTransport,
+    builds: list[storage_blob._SharedClient],
+    managed_identity: None,
+    refused_by: str,
+) -> None:
+    if refused_by == "credential":
+        _FakeCredential.error = ClientAuthenticationError(_CHAIN_DUMP)
+    else:
+        real_client.respond = _answer(401, "InvalidAuthenticationInfo")
+
+    with pytest.raises(InternalError) as exc_info:
+        await _upload()
+
+    # Detected on the SDK error itself, where it is first caught.
+    assert isinstance(exc_info.value.__cause__, ClientAuthenticationError)
+    assert builds[0].discarded and builds[0].closed
+    assert _FakeCredential.instances[0].close_calls == 1
+    assert real_client.close_calls == 1
+
+    _FakeCredential.error = None
+    real_client.respond = _succeed
+    await _upload()  # rebuilt from scratch
+    assert len(builds) == 2
+    assert len(_FakeCredential.instances) == 2
+    assert _FakeCredential.instances[1].close_calls == 0
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("failure", ["authorization", "network"])
+async def test_other_failures_keep_the_client(
+    real_client: _FakeTransport,
+    builds: list[storage_blob._SharedClient],
+    managed_identity: None,
+    failure: str,
+) -> None:
+    """A missing role (403) is not a reason to throw the credential away."""
+
+    if failure == "authorization":
+        real_client.respond = _answer(403, "AuthorizationPermissionMismatch")
+    else:
+        real_client.respond = _refuse_connection
+
+    with pytest.raises(InternalError) as exc_info:
+        await _upload()
+    assert not isinstance(exc_info.value.__cause__, ClientAuthenticationError)
+
+    real_client.respond = _succeed
+    await _upload()
+    assert len(builds) == 1
+    assert _FakeCredential.instances[0].close_calls == 0
+    assert real_client.close_calls == 0
+
+
+@pytest.mark.unit
+async def test_discarded_client_is_closed_only_after_its_last_user(
+    real_client: _FakeTransport,
+    builds: list[storage_blob._SharedClient],
+    managed_identity: None,
+) -> None:
+    async with storage_blob.blob_service_client():  # an in-flight call, e.g. a long download
+        _FakeCredential.error = ClientAuthenticationError("token rejected")
+        with pytest.raises(InternalError):
+            await _upload()
+        first = builds[0]
+        assert first.discarded and not first.closed  # still in use
+
+        _FakeCredential.error = None
+        await _upload()  # new calls get a fresh client meanwhile
+        assert len(builds) == 2
+        assert _FakeCredential.instances[0].close_calls == 0
+        assert real_client.close_calls == 0
+
+    assert first.closed
+    assert _FakeCredential.instances[0].close_calls == 1
+    assert real_client.close_calls == 1
+    assert not builds[1].closed
+
+
+@pytest.mark.unit
+async def test_client_is_not_reused_across_event_loops_or_after_a_fork(
+    real_client: _FakeTransport, builds: list[storage_blob._SharedClient]
+) -> None:
+    await _upload()
+
+    other_loop = asyncio.new_event_loop()
+    other_loop.close()
+    builds[0].loop = other_loop  # as if built on a loop that has since gone
+    await _upload()
+    assert len(builds) == 2
+
+    builds[1].pid = os.getpid() + 1  # as seen from a forked child
+    await _upload()
+    assert len(builds) == 3
+
+    # A foreign client is dropped, never awaited — even when asked to close.
+    builds[0].discarded = True
+    await builds[0].close_if_idle()
+    assert real_client.close_calls == 0
+
+    await close_storage()
+    assert real_client.close_calls == 1  # only the client that belongs here
+
+
+@pytest.mark.unit
+async def test_close_storage_closes_client_and_credential_once(
+    real_client: _FakeTransport, managed_identity: None
+) -> None:
+    await _upload()
+
+    await close_storage()
+    await close_storage()  # idempotent
+
+    assert storage_blob._client is None
+    assert _FakeCredential.instances[0].close_calls == 1
+    assert real_client.close_calls == 1
+
+
+@pytest.mark.unit
+async def test_readiness_makes_one_attempt_while_other_calls_retry(
+    real_client: _FakeTransport,
+) -> None:
+    """``retry_total=0`` on the call overrides the client-wide retry count."""
+
+    real_client.respond = _refuse_connection
+
+    assert await check_storage() is False
+    assert len(real_client.requests) == 1
+
+    with pytest.raises(InternalError):
+        await ensure_bucket()
+    assert len(real_client.requests) == 1 + 4  # one try and retry_total=3 retries
+
+
+@pytest.mark.unit
+async def test_readiness_authentication_failure_logs_one_line_and_discards(
+    real_client: _FakeTransport,
+    builds: list[storage_blob._SharedClient],
+    managed_identity: None,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Regression: every failed poll logged the multi-line credential chain."""
+
+    _FakeCredential.error = ClientAuthenticationError(_CHAIN_DUMP)
+
+    with caplog.at_level(logging.DEBUG, logger="app.storage_blob"):
+        assert await check_storage() is False
+
+    [warning] = _storage_log(caplog, logging.WARNING)
+    assert warning.getMessage() == (
+        "Storage readiness check failed: ClientAuthenticationError: DefaultAzureCredential "
+        "failed to retrieve a token from the included credentials. (shared client discarded)"
+    )
+    assert not warning.exc_info
+    [detail] = _storage_log(caplog, logging.DEBUG)
+    assert detail.exc_info  # the full chain, at DEBUG only
+
+    assert _FakeCredential.instances[0].token_requests == 1  # no retries
+    assert builds[0].discarded and builds[0].closed
+    assert _FakeCredential.instances[0].close_calls == 1
+
+
+@pytest.mark.unit
+async def test_sdk_loggers_are_quiet_unless_debugging(real_client: _FakeTransport) -> None:
+    ours = logging.getLogger("app.storage_blob")
+    http = logging.getLogger("azure.core.pipeline.policies.http_logging_policy")
+    identity = logging.getLogger("azure.identity")
+    try:
+        ours.setLevel(logging.INFO)
+        await _upload()
+        assert not http.isEnabledFor(logging.INFO)  # per-request URL and header dumps
+        assert not identity.isEnabledFor(logging.WARNING)  # per-failure credential chain
+    finally:
+        for logger in (ours, http, identity):
+            logger.setLevel(logging.NOTSET)
+
+
+@pytest.mark.unit
+async def test_malformed_connection_string_is_internal_error(
+    real_client: _FakeTransport, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("AZURE_STORAGE_CONNECTION_STRING", "not-a-connection-string")
+    get_settings.cache_clear()
+
+    with pytest.raises(InternalError, match="misconfigured"):
+        await _upload()
+    assert await check_storage() is False
 
 
 @pytest.mark.unit
 async def test_check_storage_fails_fast_when_endpoint_is_unreachable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Regression: the SDK's default retry backoff held /ready for ~85 s."""
+    """Regression: the SDK's default retry backoff held /ready for ~85 s.
+
+    Real transport against a closed loopback port.
+    """
 
     with socket.socket() as sock:  # reserve a port, then free it: nothing listens
         sock.bind(("127.0.0.1", 0))
@@ -432,187 +965,5 @@ async def test_check_storage_fails_fast_when_endpoint_is_unreachable(
     started = time.monotonic()
     with patch("app.storage_blob.blob_service_client", _REAL_BLOB_SERVICE_CLIENT):
         assert await check_storage() is False
-    assert time.monotonic() - started < storage_blob.READINESS_TIMEOUT_SECONDS + 2
-
-
-@pytest.mark.unit
-async def test_check_storage_gives_up_at_the_deadline(
-    monkeypatch: pytest.MonkeyPatch, fake_blob: FakeBlobService
-) -> None:
-    async def _hang(self: _FakeContainerClient) -> dict[str, Any]:
-        await asyncio.sleep(60)
-        return {}
-
-    monkeypatch.setattr(_FakeContainerClient, "get_container_properties", _hang)
-    monkeypatch.setattr(storage_blob, "READINESS_TIMEOUT_SECONDS", 0.05)
-    fake_blob.containers.add(CONTAINER)
-
-    assert await check_storage() is False
-
-
-@pytest.mark.unit
-async def test_missing_configuration_raises_internal_error(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.delenv("AZURE_STORAGE_ACCOUNT_URL", raising=False)
-    monkeypatch.delenv("AZURE_STORAGE_CONNECTION_STRING", raising=False)
-    get_settings.cache_clear()
-
-    with pytest.raises(InternalError) as exc_info:
-        async with _REAL_BLOB_SERVICE_CLIENT():
-            pass
-    assert "AZURE_STORAGE_ACCOUNT_URL" in exc_info.value.details["required"]
-
-
-# ---------------------------------------------------------------------------
-# shared credential (managed-identity auth)
-# ---------------------------------------------------------------------------
-
-
-class _FakeCredential:
-    instances: ClassVar[list[_FakeCredential]] = []
-
-    def __init__(self) -> None:
-        self.close_calls = 0
-        _FakeCredential.instances.append(self)
-
-    async def get_token(self, *scopes: str, **kwargs: Any) -> Any:
-        raise AssertionError("no test here reaches the network")
-
-    async def close(self) -> None:
-        self.close_calls += 1
-
-
-@pytest.fixture
-def credential_auth(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[_FakeCredential]]:
-    """Real client builder under credential auth, with a fake credential class."""
-
-    monkeypatch.delenv("AZURE_STORAGE_CONNECTION_STRING", raising=False)
-    monkeypatch.setenv("AZURE_STORAGE_ACCOUNT_URL", f"https://{ACCOUNT}.blob.core.windows.net")
-    get_settings.cache_clear()
-    _FakeCredential.instances = []
-    monkeypatch.setattr(storage_blob, "_shared", None)
-    with (
-        patch("azure.identity.aio.DefaultAzureCredential", _FakeCredential),
-        patch("app.storage_blob.blob_service_client", _REAL_BLOB_SERVICE_CLIENT),
-    ):
-        yield _FakeCredential.instances
-
-
-@pytest.mark.unit
-async def test_credential_is_shared_across_calls_and_left_open(
-    credential_auth: list[_FakeCredential],
-) -> None:
-    async with storage_blob.blob_service_client() as first:
-        pass
-    async with storage_blob.blob_service_client(fail_fast=True) as second:
-        pass
-
-    assert len(credential_auth) == 1
-    assert first.credential is second.credential is credential_auth[0]
-    assert credential_auth[0].close_calls == 0
-
-
-@pytest.mark.unit
-async def test_connection_string_auth_never_builds_a_credential(
-    credential_auth: list[_FakeCredential], monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setenv(
-        "AZURE_STORAGE_CONNECTION_STRING",
-        f"DefaultEndpointsProtocol=https;AccountName={ACCOUNT};AccountKey={ACCOUNT_KEY};"
-        "EndpointSuffix=core.windows.net",
-    )
-    get_settings.cache_clear()
-
-    async with storage_blob.blob_service_client():
-        pass
-
-    assert credential_auth == []
-
-
-@pytest.mark.unit
-async def test_auth_failure_discards_the_credential(
-    credential_auth: list[_FakeCredential],
-) -> None:
-    # Wrapped the way the public functions wrap SDK errors.
-    with pytest.raises(InternalError):
-        async with storage_blob.blob_service_client():
-            try:
-                raise ClientAuthenticationError("token rejected")
-            except ClientAuthenticationError as exc:
-                raise InternalError("wrapped") from exc
-
-    assert credential_auth[0].close_calls == 1
-    async with storage_blob.blob_service_client():
-        pass
-    assert len(credential_auth) == 2
-    assert credential_auth[1].close_calls == 0
-
-
-@pytest.mark.unit
-async def test_other_failures_keep_the_credential(
-    credential_auth: list[_FakeCredential],
-) -> None:
-    with pytest.raises(ResourceNotFoundError):
-        async with storage_blob.blob_service_client():
-            raise ResourceNotFoundError("BlobNotFound")
-    async with storage_blob.blob_service_client():
-        pass
-
-    assert len(credential_auth) == 1
-    assert credential_auth[0].close_calls == 0
-
-
-@pytest.mark.unit
-async def test_discarded_credential_closes_only_after_last_user(
-    credential_auth: list[_FakeCredential],
-) -> None:
-    async with storage_blob.blob_service_client():  # an in-flight call
-        with pytest.raises(ClientAuthenticationError):
-            async with storage_blob.blob_service_client():
-                raise ClientAuthenticationError("token rejected")
-        assert credential_auth[0].close_calls == 0  # still in use
-
-        async with storage_blob.blob_service_client():  # new calls get a fresh one
-            pass
-        assert len(credential_auth) == 2
-
-    assert credential_auth[0].close_calls == 1
-
-
-@pytest.mark.unit
-async def test_credential_is_not_reused_across_event_loops_or_past_max_age(
-    credential_auth: list[_FakeCredential], monkeypatch: pytest.MonkeyPatch
-) -> None:
-    async with storage_blob.blob_service_client():
-        pass
-    holder = storage_blob._shared
-    assert holder is not None
-
-    other_loop = asyncio.new_event_loop()
-    other_loop.close()
-    holder.loop = other_loop
-    async with storage_blob.blob_service_client():
-        pass
-    assert len(credential_auth) == 2
-    assert credential_auth[0].close_calls == 0  # foreign loop: dropped, not awaited
-
-    monkeypatch.setattr(storage_blob, "CREDENTIAL_MAX_AGE_SECONDS", 0)
-    async with storage_blob.blob_service_client():
-        pass
-    assert len(credential_auth) == 3
-    assert credential_auth[1].close_calls == 1
-
-
-@pytest.mark.unit
-async def test_close_storage_closes_the_shared_credential(
-    credential_auth: list[_FakeCredential],
-) -> None:
-    async with storage_blob.blob_service_client():
-        pass
-
-    await close_storage()
-    await close_storage()  # idempotent
-
-    assert credential_auth[0].close_calls == 1
-    assert storage_blob._shared is None
+        await close_storage()
+    assert time.monotonic() - started < 2

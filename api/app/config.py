@@ -16,7 +16,7 @@ from decimal import Decimal
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import AliasChoices, Field, field_validator
+from pydantic import AliasChoices, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 LogLevel = Literal["debug", "info", "warning", "warn", "error", "critical"]
@@ -71,9 +71,10 @@ class Settings(BaseSettings):
     # ``s3`` (default) keeps upstream behaviour: the S3-compatible client in
     # ``app.storage``. ``azureblob`` routes every ``app.storage`` call to the
     # native Azure Blob backend in ``app.storage_blob`` (docs/managed/adr/
-    # M-0001). Auth: ``azure_storage_connection_string`` when set (Azurite,
-    # account-key setups); otherwise ``DefaultAzureCredential`` against
-    # ``azure_storage_account_url`` (managed identity — no keys).
+    # M-0001). Auth: exactly one of ``azure_storage_connection_string``
+    # (Azurite, account-key setups) or ``azure_storage_account_url``
+    # (``DefaultAzureCredential`` — managed identity, no keys); the validator
+    # below refuses neither and both.
     storage_backend: Literal["s3", "azureblob"] = Field(
         default="s3",
         description="Object storage backend: 's3' (S3-compatible) or 'azureblob'.",
@@ -88,8 +89,34 @@ class Settings(BaseSettings):
     )
     azure_storage_connection_string: str = Field(
         default="",
-        description="Optional connection string (Azurite / account key); overrides the URL.",
+        description="Connection string (Azurite / account key); alternative to the URL.",
     )
+
+    @model_validator(mode="after")
+    def azure_blob_auth_is_unambiguous(self) -> Settings:
+        # Fail at startup, not on the first storage call. Both set is
+        # refused too: silently preferring one would leave the operator
+        # wrong about whether storage keys are in use.
+        #
+        # RuntimeError, not ValueError: pydantic turns a ValueError into a
+        # ValidationError that prints the model's whole input — every
+        # setting, including the connection string's account key.
+        if self.storage_backend != "azureblob":
+            return self
+        has_url = bool(self.azure_storage_account_url)
+        has_connection_string = bool(self.azure_storage_connection_string)
+        if not has_url and not has_connection_string:
+            raise RuntimeError(
+                "STORAGE_BACKEND=azureblob requires AZURE_STORAGE_ACCOUNT_URL (managed "
+                "identity) or AZURE_STORAGE_CONNECTION_STRING (account key)"
+            )
+        if has_url and has_connection_string:
+            raise RuntimeError(
+                "STORAGE_BACKEND=azureblob accepts only one of AZURE_STORAGE_ACCOUNT_URL "
+                "(managed identity) and AZURE_STORAGE_CONNECTION_STRING (account key); "
+                "both are set"
+            )
+        return self
 
     # ----- File upload limits (Task C4) -----
     # Per-request cap on uploaded-file size. Documented in `.env.example`
